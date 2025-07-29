@@ -1,0 +1,7 @@
+Soccernet/
+.vscode/
+__pycache__
+runs/
+yolo_dataset_proper
+*.zip
+*.pt
