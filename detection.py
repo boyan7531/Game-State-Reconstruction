@@ -135,7 +135,7 @@ def train_yolo_model(
     model_size: str = 'yolov8m.pt',
     epochs: int = 100,
     imgsz: int = 640,
-    batch_size: int = 16,
+    batch_size: int = 32,
     device: str = 'auto',
     project: str = 'runs/detect',
     name: str = 'soccernet_gsr',
@@ -159,6 +159,12 @@ def train_yolo_model(
         patience: Early stopping patience
         **kwargs: Additional training arguments
     """
+    
+    # Enable TF32 for faster training on RTX 4090
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("✅ TF32 enabled for faster training")
     
     # Load model
     print(f"Loading YOLO model: {model_size}")
@@ -190,7 +196,7 @@ def train_yolo_model(
         print(f"⚠️  Device check failed: {e}, using CPU")
         device = 'cpu'
     
-    # Training arguments
+    # Training arguments with optimizations
     train_args = {
         'data': data_yaml,
         'epochs': epochs,
@@ -201,6 +207,10 @@ def train_yolo_model(
         'name': name,
         'save_period': save_period,
         'patience': patience,
+        'workers': 8,  # More data loading threads
+        'val_period': 5,  # Validate every 5 epochs instead of every epoch
+        'amp': True,  # Explicit AMP (already default but explicit)
+        'pin_memory': True,  # Faster CPU-GPU transfer
         'optimizer': 'AdamW',
         'lr0': 0.01,
         'lrf': 0.01,
@@ -343,15 +353,15 @@ def main():
         print("Creating dataset configuration...")
         create_dataset_yaml(data_dir, dataset_yaml)
     
-    # Training configuration
+    # Training configuration (optimized for RTX 4090)
     training_config = {
         'model_size': 'yolov8m.pt',  # Medium model for good balance
         'epochs': 100,
         'imgsz': 640,
-        'batch_size': 16,  # Adjust based on GPU memory
+        'batch_size': 32,  # Optimized for RTX 4090 (24GB VRAM)
         'device': 'auto',
         'project': 'runs/detect',
-        'name': 'soccernet_gsr_v1',
+        'name': 'soccernet_gsr_v1_optimized',
         'save_period': 10,
         'patience': 20,
     }
