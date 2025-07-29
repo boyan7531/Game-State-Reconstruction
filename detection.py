@@ -208,7 +208,6 @@ def train_yolo_model(
         'save_period': save_period,
         'patience': patience,
         'workers': 8,  # More data loading threads
-        'val_period': 5,  # Validate every 5 epochs instead of every epoch
         'amp': True,  # Explicit AMP (already default but explicit)
         'pin_memory': True,  # Faster CPU-GPU transfer
         'optimizer': 'AdamW',
