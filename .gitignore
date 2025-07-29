@@ -5,3 +5,7 @@ runs/
 yolo_dataset_proper
 *.zip
 *.pt
+test.py
+results-2.csv
+*.csv
+test_results/
