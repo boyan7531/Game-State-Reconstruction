@@ -135,7 +135,7 @@ def train_yolo_model(
     model_size: str = 'yolov8m.pt',
     epochs: int = 100,
     imgsz: int = 640,
-    batch_size: int = 32,
+    batch_size: int = 52,
     device: str = 'auto',
     project: str = 'runs/detect',
     name: str = 'soccernet_gsr',
@@ -357,7 +357,7 @@ def main():
         'model_size': 'yolov8m.pt',  # Medium model for good balance
         'epochs': 100,
         'imgsz': 640,
-        'batch_size': 32,  # Optimized for RTX 4090 (24GB VRAM)
+        'batch_size': 52,  # Optimized for RTX 4090 (24GB VRAM)
         'device': 'auto',
         'project': 'runs/detect',
         'name': 'soccernet_gsr_v1_optimized',
