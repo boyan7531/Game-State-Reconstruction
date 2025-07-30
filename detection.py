@@ -141,6 +141,7 @@ def train_yolo_model(
     name: str = 'soccernet_gsr',
     save_period: int = 10,
     patience: int = 50,
+    dataset_size: int = None,
     **kwargs
 ):
     """
@@ -157,6 +158,7 @@ def train_yolo_model(
         name: Experiment name
         save_period: Save checkpoint every N epochs
         patience: Early stopping patience
+        dataset_size: Number of training images (auto-detected if None)
         **kwargs: Additional training arguments
     """
     
@@ -196,6 +198,34 @@ def train_yolo_model(
         print(f"⚠️  Device check failed: {e}, using CPU")
         device = 'cpu'
     
+    # Adaptive learning rate based on dataset size
+    if dataset_size is None:
+        # Try to estimate dataset size from YAML
+        try:
+            with open(data_yaml, 'r') as f:
+                yaml_data = yaml.safe_load(f)
+            train_path = os.path.join(yaml_data['path'], yaml_data['train'])
+            if os.path.exists(train_path):
+                dataset_size = len([f for f in os.listdir(train_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+                print(f"📊 Estimated dataset size: {dataset_size} images")
+        except:
+            dataset_size = 5000  # fallback estimate
+            print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
+    
+    # Scale learning rate based on dataset size
+    # Base LR for ~1600 images: 0.0004, scale down for larger datasets
+    base_lr = 0.0004
+    if dataset_size <= 2000:
+        lr0 = base_lr
+    elif dataset_size <= 10000:
+        lr0 = base_lr * 0.7  # ~0.00028
+    elif dataset_size <= 30000:
+        lr0 = base_lr * 0.5  # ~0.0002
+    else:
+        lr0 = base_lr * 0.3  # ~0.00012 for very large datasets
+    
+    print(f"📈 Adaptive learning rate: {lr0:.6f} (dataset size: {dataset_size})")
+    
     # Training arguments with optimizations
     train_args = {
         'data': data_yaml,
@@ -210,13 +240,13 @@ def train_yolo_model(
         'workers': 8,  # More data loading threads
         'amp': True,  # Explicit AMP (already default but explicit)
         'optimizer': 'AdamW',
-        'lr0': 0.01,
+        'lr0': lr0,  # Adaptive learning rate
         'lrf': 0.01,
         'momentum': 0.937,
         'weight_decay': 0.0005,
         'warmup_epochs': 3,
         'warmup_momentum': 0.8,
-        'warmup_bias_lr': 0.1,
+        'warmup_bias_lr': lr0 * 0.1,  # Scale warmup bias LR too
         'box': 7.5,
         'cls': 0.5,
         'dfl': 1.5,
@@ -242,10 +272,11 @@ def train_yolo_model(
     }
     
     print("📋 Training configuration:")
-    key_params = ['epochs', 'batch', 'imgsz', 'device', 'optimizer', 'lr0']
+    key_params = ['epochs', 'batch', 'imgsz', 'device', 'optimizer', 'lr0', 'warmup_bias_lr']
     for key in key_params:
         if key in train_args:
             print(f"  {key}: {train_args[key]}")
+    print(f"  dataset_size: {dataset_size}")
     print(f"  ... and {len(train_args) - len(key_params)} more parameters")
     
     print("\n🔄 Initializing training...")
@@ -354,10 +385,10 @@ def main():
     
     # Training configuration (optimized for RTX 4090)
     training_config = {
-        'model_size': 'yolov8m.pt',  # Medium model for good balance
+        'model_size': 'yolov8l.pt',  # Medium model for good balance
         'epochs': 100,
-        'imgsz': 640,
-        'batch_size': 52,  # Optimized for RTX 4090 (24GB VRAM)
+        'imgsz': 1280,
+        'batch_size': 8,  # Optimized for RTX 4090 (24GB VRAM)
         'device': 'auto',
         'project': 'runs/detect',
         'name': 'soccernet_gsr_v1_optimized',
