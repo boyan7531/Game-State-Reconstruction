@@ -9,3 +9,6 @@ test.py
 results-2.csv
 *.csv
 test_results/
+yolo_dataset_subset_10k
+.kiro
+*soccernet_dataset_test.yaml

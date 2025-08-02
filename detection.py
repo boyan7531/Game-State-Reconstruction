@@ -247,25 +247,23 @@ def train_yolo_model(
         'warmup_epochs': 3,
         'warmup_momentum': 0.8,
         'warmup_bias_lr': lr0 * 0.1,  # Scale warmup bias LR too
-        'box': 7.5,
-        'cls': 0.5,
-        'dfl': 1.5,
-        'pose': 12.0,
-        'kobj': 1.0,
+        'box': 10.0,  # Increased for better ball localization
+        'cls': 2.5,   # Higher for better class distinction
+        'dfl': 2.0,   # Increased for better box regression distribution
         'label_smoothing': 0.0,
         'nbs': 64,
-        # Data augmentation disabled - using raw data only
-        'hsv_h': 0.0,
-        'hsv_s': 0.0,
-        'hsv_v': 0.0,
-        'degrees': 0.0,
-        'translate': 0.0,
-        'scale': 0.0,
+        # Minimal augmentation to help with ball detection
+        'hsv_h': 0.01,    # Slight color variation
+        'hsv_s': 0.5,     # Saturation changes help with ball visibility
+        'hsv_v': 0.4,     # Brightness changes for different lighting
+        'degrees': 5.0,   # Small rotation for ball orientation
+        'translate': 0.05, # Small translation for position variance
+        'scale': 0.1,     # Scale variation for ball size differences
         'shear': 0.0,
         'perspective': 0.0,
         'flipud': 0.0,
-        'fliplr': 0.0,
-        'mosaic': 0.0,
+        'fliplr': 0.5,    # Horizontal flip is valid for soccer
+        'mosaic': 0.0,    # Keep disabled - can hurt small object detection
         'mixup': 0.0,
         'copy_paste': 0.0,
         **kwargs
@@ -388,7 +386,7 @@ def main():
         'model_size': 'yolov8l.pt',  # Medium model for good balance
         'epochs': 100,
         'imgsz': 1280,
-        'batch_size': 8,  # Optimized for RTX 4090 (24GB VRAM)
+        'batch_size': 6,  # Reduced to allow for higher resolution training
         'device': 'auto',
         'project': 'runs/detect',
         'name': 'soccernet_gsr_v1_optimized',

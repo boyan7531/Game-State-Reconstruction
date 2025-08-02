@@ -9,4 +9,6 @@ for filename in os.listdir(base_dir):
         print(f"Extracting {zip_path} to {extract_dir}...")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(extract_dir)
-print("All zip files extracted.")
+        print(f"Deleting {zip_path}...")
+        os.remove(zip_path)
+print("All zip files extracted and deleted.")
