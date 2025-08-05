@@ -9,3 +9,9 @@ test.py
 results-2.csv
 *.csv
 test_results/
+soccernet_dataset_test.yaml
+*.img
+*.png
+yolo_dataset_subset_10k
+visualize_training_images.py
+visualize_training_images.py
