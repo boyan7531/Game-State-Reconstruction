@@ -250,8 +250,6 @@ def train_yolo_model(
         'box': 7.5,
         'cls': 0.5,
         'dfl': 1.5,
-        'pose': 12.0,
-        'kobj': 1.0,
         'label_smoothing': 0.0,
         'nbs': 64,
         # Data augmentation disabled - using raw data only
