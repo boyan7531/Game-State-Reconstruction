@@ -132,7 +132,7 @@ def create_dataset_yaml(data_dir: str, output_path: str = "dataset.yaml"):
 
 def train_yolo_model(
     data_yaml: str,
-    model_size: str = 'yolov8m.pt',
+    model_size: str = 'yolo12l.pt',
     epochs: int = 100,
     imgsz: int = 640,
     batch_size: int = 52,
@@ -149,7 +149,7 @@ def train_yolo_model(
     
     Args:
         data_yaml: Path to dataset YAML configuration
-        model_size: YOLO model size ('yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt', 'yolov8l.pt', 'yolov8x.pt')
+        model_size: YOLO model size ('yolo12n.pt', 'yolo12s.pt', 'yolo12m.pt', 'yolo12l.pt', 'yolo12x.pt')
         epochs: Number of training epochs
         imgsz: Input image size
         batch_size: Batch size for training
@@ -383,13 +383,13 @@ def main():
     
     # Training configuration (optimized for RTX 4090)
     training_config = {
-        'model_size': 'yolov8l.pt',  # Medium model for good balance
+        'model_size': 'yolo12l.pt',  # YOLOv12 Large model for better performance
         'epochs': 100,
         'imgsz': 1280,
         'batch_size': 8,  # Optimized for RTX 4090 (24GB VRAM)
         'device': 'auto',
         'project': 'runs/detect',
-        'name': 'soccernet_gsr_v1_optimized',
+        'name': 'soccernet_gsr_v12_optimized',
         'save_period': 10,
         'patience': 20,
     }
