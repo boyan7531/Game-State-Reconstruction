@@ -212,19 +212,11 @@ def train_yolo_model(
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
     
-    # Scale learning rate based on dataset size
-    # Base LR for ~1600 images: 0.0004, scale down for larger datasets
-    base_lr = 0.0004
-    if dataset_size <= 2000:
-        lr0 = base_lr
-    elif dataset_size <= 10000:
-        lr0 = base_lr * 0.7  # ~0.00028
-    elif dataset_size <= 30000:
-        lr0 = base_lr * 0.5  # ~0.0002
-    else:
-        lr0 = base_lr * 0.3  # ~0.00012 for very large datasets
+    # Use LR Finder suggested learning rate
+    # LR Finder found optimal LR of 0.1 for this dataset (42,750 images)
+    lr0 = 0.1  # Suggested by LR Finder analysis
     
-    print(f"📈 Adaptive learning rate: {lr0:.6f} (dataset size: {dataset_size})")
+    print(f"🎯 Using LR Finder suggested learning rate: {lr0:.6f} (dataset size: {dataset_size})")
     
     # Training arguments with optimizations
     train_args = {
