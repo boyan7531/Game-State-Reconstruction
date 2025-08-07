@@ -212,8 +212,7 @@ def train_yolo_model(
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
     
-    # Use LR Finder suggested learning rate
-    # LR Finder found optimal LR of 0.1 for this dataset (42,750 images)
+    
     lr0 = 0.1  # Suggested by LR Finder analysis
     
     print(f"🎯 Using LR Finder suggested learning rate: {lr0:.6f} (dataset size: {dataset_size})")
@@ -242,6 +241,7 @@ def train_yolo_model(
         'dfl': 1.5,
         'label_smoothing': 0.0,
         'nbs': 64,
+        'plots': True,  # Enable confusion matrix and other plots during validation
         # Data augmentation disabled - using raw data only
         'hsv_h': 0.0,
         'hsv_s': 0.0,
