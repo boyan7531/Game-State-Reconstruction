@@ -301,7 +301,7 @@ def train_yolo_model(
 
 def validate_model(model_path: str, data_yaml: str, **kwargs):
     """
-    Validate trained model on test/validation set.
+    Validate trained model on test/validation set with detailed per-class metrics.
     
     Args:
         model_path: Path to trained model weights
@@ -316,12 +316,39 @@ def validate_model(model_path: str, data_yaml: str, **kwargs):
         pbar.update(0.3)
         
         pbar.set_postfix_str("Running validation...")
-        results = model.val(data=data_yaml, **kwargs)
+        # Enable verbose output to show per-class metrics
+        results = model.val(data=data_yaml, verbose=True, **kwargs)
         pbar.update(0.7)
         
         pbar.set_postfix_str("Completed")
     
     print("✅ Validation completed!")
+    
+    # Print detailed per-class metrics if available
+    if hasattr(results, 'results_dict') and results.results_dict:
+        print("\n📊 Detailed Validation Metrics:")
+        print("-" * 40)
+        
+        # Overall metrics
+        if 'metrics/mAP50(B)' in results.results_dict:
+            print(f"Overall mAP@0.5: {results.results_dict['metrics/mAP50(B)']:.4f}")
+        if 'metrics/mAP50-95(B)' in results.results_dict:
+            print(f"Overall mAP@0.5:0.95: {results.results_dict['metrics/mAP50-95(B)']:.4f}")
+        
+        # Per-class metrics (if available)
+        class_names = ['player', 'goalkeeper', 'referee', 'ball']
+        print(f"\n📋 Per-Class mAP@0.5:")
+        for i, class_name in enumerate(class_names):
+            class_key = f'metrics/mAP50(B)_class_{i}'
+            if class_key in results.results_dict:
+                print(f"  {class_name}: {results.results_dict[class_key]:.4f}")
+        
+        print(f"\n📋 Per-Class mAP@0.5:0.95:")
+        for i, class_name in enumerate(class_names):
+            class_key = f'metrics/mAP50-95(B)_class_{i}'
+            if class_key in results.results_dict:
+                print(f"  {class_name}: {results.results_dict[class_key]:.4f}")
+    
     return results
 
 def main():
