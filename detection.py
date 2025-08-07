@@ -236,9 +236,7 @@ def train_yolo_model(
         'lrf': 0.01,
         'momentum': 0.937,
         'weight_decay': 0.0005,
-        'warmup_epochs': 3,
-        'warmup_momentum': 0.8,
-        'warmup_bias_lr': lr0 * 0.1,  # Scale warmup bias LR too
+        'warmup_epochs': 0,
         'box': 7.5,
         'cls': 0.5,
         'dfl': 1.5,
@@ -262,7 +260,7 @@ def train_yolo_model(
     }
     
     print("📋 Training configuration:")
-    key_params = ['epochs', 'batch', 'imgsz', 'device', 'optimizer', 'lr0', 'warmup_bias_lr']
+    key_params = ['epochs', 'batch', 'imgsz', 'device', 'optimizer', 'lr0']
     for key in key_params:
         if key in train_args:
             print(f"  {key}: {train_args[key]}")
