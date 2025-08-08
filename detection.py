@@ -212,11 +212,10 @@ def train_yolo_model(
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
     
-    # Use LR Finder suggested learning rate
-    # LR Finder found optimal LR of 0.1 for this dataset (42,750 images)
-    lr0 = 0.1  # Suggested by LR Finder analysis
     
-    print(f"🎯 Using LR Finder suggested learning rate: {lr0:.6f} (dataset size: {dataset_size})")
+    # Learning rate tuned for short (3–5 epoch) fine-tunes with AdamW
+    lr0 = 0.003
+    
     
     # Training arguments with optimizations
     train_args = {
@@ -232,16 +231,16 @@ def train_yolo_model(
         'workers': 8,  # More data loading threads
         'amp': True,  # Explicit AMP (already default but explicit)
         'optimizer': 'AdamW',
-        'lr0': lr0,  # Adaptive learning rate
-        'lrf': 0.01,
-        'momentum': 0.937,
+        'lr0': lr0,
+        'lrf': 0.2,
+        'momentum': 0.9,
         'weight_decay': 0.0005,
-        'warmup_epochs': 0,
+        'warmup_epochs': 0.5,
         'box': 7.5,
         'cls': 0.5,
         'dfl': 1.5,
         'label_smoothing': 0.0,
-        'nbs': 64,
+        'nbs': 32,
         # Data augmentation disabled - using raw data only
         'hsv_h': 0.0,
         'hsv_s': 0.0,
@@ -374,14 +373,14 @@ def main():
     # Training configuration (optimized for RTX 4090)
     training_config = {
         'model_size': 'yolo12l.pt',  # YOLOv12 Large model for better performance
-        'epochs': 100,
+        'epochs': 5,
         'imgsz': 1280,
         'batch_size': 8,  # Optimized for RTX 4090 (24GB VRAM)
         'device': 'auto',
         'project': 'runs/detect',
         'name': 'soccernet_gsr_v12_optimized',
         'save_period': 10,
-        'patience': 20,
+        'patience': 3,
     }
     
     print("\n🚀 Starting YOLO training for SoccerNet GSR...")
