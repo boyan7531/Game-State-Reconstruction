@@ -216,6 +216,10 @@ def train_yolo_model(
     # Learning rate tuned for short (3–5 epoch) fine-tunes with AdamW
     lr0 = 0.003
     
+    # Choose when to stop using mosaic augmentation based on total epochs
+    # For short runs, stop around halfway; for >=20 epochs, stop at epoch 10
+    close_mosaic_epoch = 10 if epochs >= 20 else max(1, int(epochs / 2))
+    
     
     # Training arguments with optimizations
     train_args = {
@@ -241,20 +245,21 @@ def train_yolo_model(
         'dfl': 1.5,
         'label_smoothing': 0.0,
         'nbs': 32,
-        # Data augmentation disabled - using raw data only
-        'hsv_h': 0.0,
-        'hsv_s': 0.0,
-        'hsv_v': 0.0,
-        'degrees': 0.0,
-        'translate': 0.0,
-        'scale': 0.0,
-        'shear': 0.0,
+        # Light data augmentation tuned for soccer footage
+        'hsv_h': 0.015,
+        'hsv_s': 0.4,
+        'hsv_v': 0.2,
+        'degrees': 5.0,
+        'translate': 0.06,
+        'scale': 0.2,
+        'shear': 0.05,
         'perspective': 0.0,
         'flipud': 0.0,
-        'fliplr': 0.0,
-        'mosaic': 0.0,
-        'mixup': 0.0,
+        'fliplr': 0.5,
+        'mosaic': 0.2,
+        'mixup': 0.05,
         'copy_paste': 0.0,
+        'close_mosaic': close_mosaic_epoch,
         **kwargs
     }
     
@@ -372,10 +377,10 @@ def main():
     
     # Training configuration (optimized for RTX 4090)
     training_config = {
-        'model_size': 'yolo12l.pt',  # YOLOv12 Large model for better performance
+        'model_size': 'yolov8l.pt',  # YOLOv12 Large model for better performance
         'epochs': 5,
         'imgsz': 1280,
-        'batch_size': 8,  # Optimized for RTX 4090 (24GB VRAM)
+        'batch_size': 10,  # Optimized for RTX 4090 (24GB VRAM)
         'device': 'auto',
         'project': 'runs/detect',
         'name': 'soccernet_gsr_v12_optimized',
