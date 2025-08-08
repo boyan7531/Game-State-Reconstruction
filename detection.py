@@ -239,12 +239,12 @@ def train_yolo_model(
         'lrf': 0.2,
         'momentum': 0.9,
         'weight_decay': 0.0005,
-        'warmup_epochs': 0.5,
+        'warmup_epochs': 1,
         'box': 7.5,
         'cls': 0.5,
         'dfl': 1.5,
         'label_smoothing': 0.0,
-        'nbs': 32,
+        'nbs': 64,
         # Light data augmentation tuned for soccer footage
         'hsv_h': 0.015,
         'hsv_s': 0.4,
@@ -378,7 +378,7 @@ def main():
     # Training configuration (optimized for RTX 4090)
     training_config = {
         'model_size': 'yolov8l.pt',  # YOLOv12 Large model for better performance
-        'epochs': 5,
+        'epochs': 10,
         'imgsz': 1280,
         'batch_size': 10,  # Optimized for RTX 4090 (24GB VRAM)
         'device': 'auto',
