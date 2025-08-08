@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Script to create proper YOLO format dataset from SoccerNet GSR data.
-Creates separate train/val/test splits in YOLO format.
+Creates train/val splits in YOLO format.
 """
 
 from dataset import SoccerNetGSRDataset, YOLODataset
@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from PIL import Image
 import numpy as np
+import shutil
 
 def create_yolo_files_split(dataset: YOLODataset, output_dir: str, split_name: str):
     """Create YOLO format files for a specific split."""
@@ -25,12 +26,28 @@ def create_yolo_files_split(dataset: YOLODataset, output_dir: str, split_name: s
     for i in range(len(dataset)):
         data = dataset[i]
         
-        # Save image
+        # Prepare image target filename
         img_filename = f"{data['sequence']}_{data['frame_idx']:06d}.jpg"
         img_path = images_dir / img_filename
         
-        image_pil = Image.fromarray(data["image"])
-        image_pil.save(img_path)
+        # Source image path in SoccerNet
+        seq_name = data["sequence"]
+        frame_idx = data["frame_idx"]
+        src_img_path = (
+            Path("SoccerNet/SN-GSR-2025")
+            / split_name.replace("val", "valid")
+            / seq_name
+            / "img1"
+            / f"{frame_idx:06d}.jpg"
+        )
+        
+        # Create a hard link if possible (fast, no copy); fallback to copy
+        if not img_path.exists():
+            try:
+                os.link(src_img_path, img_path)
+            except OSError:
+                # Fallback to copy if hardlink fails (e.g., cross-device)
+                shutil.copy2(src_img_path, img_path)
         
         # Save labels
         label_filename = f"{data['sequence']}_{data['frame_idx']:06d}.txt"
@@ -57,7 +74,6 @@ def create_dataset_yaml(output_dir: str):
 path: {Path(output_dir).absolute()}  # Dataset root dir
 train: train/images  # Train images (relative to 'path')
 val: val/images      # Val images (relative to 'path')
-test: test/images    # Test images (relative to 'path')
 
 # Classes
 nc: 4  # Number of classes
@@ -76,17 +92,16 @@ names:
     return yaml_path
 
 def main():
-    """Main function to create complete YOLO dataset with train/val/test splits."""
+    """Main function to create complete YOLO dataset with train/val splits."""
     # Configuration
     data_root = "SoccerNet/SN-GSR-2025"
     output_dir = "yolo_dataset_proper"
     
     # Define splits to process
-    splits = ["train", "valid", "test"]
+    splits = ["train", "valid"]
     split_mapping = {
         "train": "train",
         "valid": "val",  # Rename 'valid' to 'val' for YOLO convention
-        "test": "test"
     }
     
     print("Creating proper YOLO dataset structure...")
@@ -109,7 +124,7 @@ def main():
             base_dataset = SoccerNetGSRDataset(
                 data_root=data_root,
                 split=split,
-                load_images=True
+                load_images=False  # Faster: don't load image arrays
             )
             
             print(f"Loaded {len(base_dataset.sequences)} sequences, {len(base_dataset)} frames")
@@ -152,9 +167,6 @@ def main():
     print(f"  ├── val/")
     print(f"  │   ├── images/     # {split_stats.get('val', {}).get('frames', 0)} files")
     print(f"  │   └── labels/     # {split_stats.get('val', {}).get('frames', 0)} files")
-    print(f"  ├── test/")
-    print(f"  │   ├── images/     # {split_stats.get('test', {}).get('frames', 0)} files")
-    print(f"  │   └── labels/     # {split_stats.get('test', {}).get('frames', 0)} files")
     print(f"  └── dataset.yaml")
     
     print("\nSplit statistics:")
@@ -170,7 +182,6 @@ def main():
     print("\nNext steps:")
     print(f"1. Update detection.py to use: {output_dir}/dataset.yaml")
     print("2. Run training with proper train/val separation")
-    print("3. Use test split for final evaluation")
     
 if __name__ == "__main__":
     main()

@@ -222,11 +222,14 @@ class YOLODataset(Dataset):
         # Get base data
         data = self.base_dataset[idx]
         
-        if "image" not in data:
-            raise ValueError("Base dataset must load images for YOLO format")
-        
-        image = data["image"]
-        img_height, img_width = image.shape[:2]
+        # Determine image dimensions without requiring the image to be loaded
+        image = data.get("image")
+        if image is not None:
+            img_height, img_width = image.shape[:2]
+        else:
+            # Use metadata when image is not loaded (faster path)
+            img_width = int(data["image_info"]["width"])  # type: ignore[index]
+            img_height = int(data["image_info"]["height"])  # type: ignore[index]
         
         # Convert annotations to YOLO format
         yolo_labels = []
@@ -239,11 +242,15 @@ class YOLODataset(Dataset):
                 yolo_labels.append([class_id] + bbox_yolo)
         
         result = {
-            "image": image,
             "labels": np.array(yolo_labels) if yolo_labels else np.empty((0, 5)),
             "sequence": data["sequence"],
-            "frame_idx": data["frame_idx"]
+            "frame_idx": data["frame_idx"],
+            "image_info": data["image_info"],
         }
+        
+        # Only include the image array when it was actually loaded
+        if image is not None:
+            result["image"] = image
         
         if self.transform:
             result = self.transform(result)

@@ -39,3 +39,6 @@ pytest>=7.4.0
 black>=23.0.0
 flake8>=6.0.0
 jupyter>=1.0.0
+
+# Hugging Face
+huggingface_hub>=0.19.0
