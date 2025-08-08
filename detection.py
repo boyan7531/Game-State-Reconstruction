@@ -303,27 +303,54 @@ def train_yolo_model(
         print(f"\n❌ Training failed: {e}")
         raise
 
-def validate_model(model_path: str, data_yaml: str, **kwargs):
+def validate_model(model_path: str, data_yaml: str, device: str = 'auto', batch_size: int = 32, **kwargs):
     """
     Validate trained model on test/validation set.
     
     Args:
         model_path: Path to trained model weights
         data_yaml: Path to dataset YAML configuration
+        device: Device to use for validation ('auto', 'cpu', '0', '1', etc.)
+        batch_size: Batch size for validation (larger = faster)
         **kwargs: Additional validation arguments
     """
     print(f"🔍 Validating model: {model_path}")
     
-    with tqdm(total=1, desc="Validation", unit="phase") as pbar:
-        model = YOLO(model_path)
+    # Set device based on availability (matching training logic)
+    if device == 'auto':
+        if torch.backends.mps.is_available():
+            device = 'mps'
+        elif torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
+    
+    # Optimized validation arguments
+    val_args = {
+        'data': data_yaml,
+        'device': device,
+        'batch': batch_size,  # Larger batch size for faster validation
+        'imgsz': 1280,        # Match training image size
+        'workers': 8,         # Parallel data loading
+        'verbose': True,      # Show detailed progress
+        **kwargs
+    }
+    
+    # More informative progress tracking
+    with tqdm(total=3, desc="Validation", unit="phase") as pbar:
         pbar.set_postfix_str("Loading model...")
-        pbar.update(0.3)
+        model = YOLO(model_path)
+        pbar.update(1)
         
         pbar.set_postfix_str("Running validation...")
-        results = model.val(data=data_yaml, **kwargs)
-        pbar.update(0.7)
+        results = model.val(**val_args)
+        pbar.update(1)
         
-        pbar.set_postfix_str("Completed")
+        # Display key metrics
+        if hasattr(results, 'box') and hasattr(results.box, 'map'):
+            metrics_str = f"mAP@0.5: {results.box.map50:.4f} | mAP@0.5:0.95: {results.box.map:.4f}"
+            pbar.set_postfix_str(metrics_str)
+        pbar.update(1)
     
     print("✅ Validation completed!")
     return results
@@ -398,7 +425,12 @@ def main():
         best_model_path = f"{training_config['project']}/{training_config['name']}/weights/best.pt"
         if os.path.exists(best_model_path):
             print("\n🔍 Running validation on best model...")
-            val_results = validate_model(best_model_path, dataset_yaml)
+            val_results = validate_model(
+                best_model_path, 
+                dataset_yaml,
+                device=training_config['device'],
+                batch_size=min(training_config['batch_size'] * 2, 64)  # Larger batch for validation
+            )
         
         print("\n" + "="*50)
         print("🎉 TRAINING SUMMARY")
