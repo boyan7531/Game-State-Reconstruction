@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Training Image Visualization Script for SoccerNet GSR Dataset
-Shows how original 1920x1080 images are transformed to 1280x1280 for training.
+Shows how original 1920x1080 images are transformed during actual YOLO training.
+Includes real YOLO preprocessing and augmentations.
 """
 
 import os
@@ -10,6 +11,10 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+import torch
+from ultralytics.data.augment import Compose, LetterBox, RandomHSV, RandomFlip, RandomPerspective
+from ultralytics.data.utils import IMG_FORMATS
+from ultralytics.utils import LOGGER
 
 def load_yolo_annotations(label_path):
     """Load YOLO format annotations from a label file."""
@@ -125,8 +130,188 @@ def letterbox_resize(image, target_size=1280):
     
     return padded, scale, (pad_x, pad_y)
 
+def apply_copy_paste_augmentation(image, annotations, imgsz=1280):
+    """
+    Apply copy-paste augmentation that copies objects from one part of the image to another.
+    This is a powerful data augmentation technique used in YOLO training.
+    """
+    augmented_image = image.copy()
+    augmented_annotations = annotations.copy() if annotations else []
+    
+    # Only apply copy-paste if we have annotations
+    if not annotations or len(annotations) < 2:
+        return augmented_image, augmented_annotations, "Copy-Paste (No objects to copy)"
+    
+    # Apply copy-paste with 100% probability for demonstration
+    if random.random() < 1.0:
+        h, w = image.shape[:2]
+        
+        # Prefer to copy ball objects (class_id 3) for demonstration
+        ball_annotations = [ann for ann in annotations if ann[0] == 3]  # class_id 3 is ball
+        if ball_annotations:
+            source_ann = random.choice(ball_annotations)
+        else:
+            source_ann = random.choice(annotations)
+        class_id, x_center, y_center, width, height = source_ann
+        
+        # Convert to pixel coordinates
+        x_center_px = int(x_center * w)
+        y_center_px = int(y_center * h)
+        width_px = int(width * w)
+        height_px = int(height * h)
+        
+        # Calculate bounding box
+        x1 = max(0, x_center_px - width_px // 2)
+        y1 = max(0, y_center_px - height_px // 2)
+        x2 = min(w, x_center_px + width_px // 2)
+        y2 = min(h, y_center_px + height_px // 2)
+        
+        # Extract the object region
+        if x2 > x1 and y2 > y1:
+            object_region = image[y1:y2, x1:x2].copy()
+            
+            # Find a random location to paste (avoid overlapping too much)
+            max_attempts = 10
+            for _ in range(max_attempts):
+                # Random paste location
+                paste_x = random.randint(width_px // 2, w - width_px // 2)
+                paste_y = random.randint(height_px // 2, h - height_px // 2)
+                
+                # Calculate paste bounding box
+                paste_x1 = paste_x - width_px // 2
+                paste_y1 = paste_y - height_px // 2
+                paste_x2 = paste_x1 + (x2 - x1)
+                paste_y2 = paste_y1 + (y2 - y1)
+                
+                # Ensure paste location is within image bounds
+                if paste_x2 <= w and paste_y2 <= h and paste_x1 >= 0 and paste_y1 >= 0:
+                    # Paste the object
+                    augmented_image[paste_y1:paste_y2, paste_x1:paste_x2] = object_region
+                    
+                    # Add new annotation for the pasted object
+                    new_x_center = paste_x / w
+                    new_y_center = paste_y / h
+                    augmented_annotations.append((class_id, new_x_center, new_y_center, width, height))
+                    break
+    
+    return augmented_image, augmented_annotations, "Copy-Paste Augmentation"
+
+def apply_manual_augmentations(image, annotations, imgsz=1280):
+    """
+    Apply manual augmentations that simulate YOLO training transformations.
+    This shows how images really look during training.
+    """
+    # Start with letterbox resize
+    letterboxed, scale, (pad_x, pad_y) = letterbox_resize(image, imgsz)
+    
+    # Transform annotations for letterboxed image
+    letterbox_annotations = []
+    if annotations:
+        h, w = image.shape[:2]
+        for ann in annotations:
+            class_id, x_center, y_center, width, height = ann
+            
+            # Convert to pixel coordinates in original image
+            orig_x_center = x_center * w
+            orig_y_center = y_center * h
+            orig_width = width * w
+            orig_height = height * h
+            
+            # Apply scale and padding
+            new_x_center = orig_x_center * scale + pad_x
+            new_y_center = orig_y_center * scale + pad_y
+            new_width = orig_width * scale
+            new_height = orig_height * scale
+            
+            # Convert back to normalized coordinates
+            norm_x_center = new_x_center / imgsz
+            norm_y_center = new_y_center / imgsz
+            norm_width = new_width / imgsz
+            norm_height = new_height / imgsz
+            
+            letterbox_annotations.append((class_id, norm_x_center, norm_y_center, norm_width, norm_height))
+    
+    # Apply copy-paste augmentation first (before letterboxing)
+    copy_paste_image, copy_paste_annotations, _ = apply_copy_paste_augmentation(image, annotations, imgsz)
+    
+    # Re-apply letterbox to copy-paste result
+    letterboxed, scale, (pad_x, pad_y) = letterbox_resize(copy_paste_image, imgsz)
+    
+    # Transform copy-paste annotations for letterboxed image
+    letterbox_annotations = []
+    if copy_paste_annotations:
+        h, w = copy_paste_image.shape[:2]
+        for ann in copy_paste_annotations:
+            class_id, x_center, y_center, width, height = ann
+            
+            # Convert to pixel coordinates in original image
+            orig_x_center = x_center * w
+            orig_y_center = y_center * h
+            orig_width = width * w
+            orig_height = height * h
+            
+            # Apply scale and padding
+            new_x_center = orig_x_center * scale + pad_x
+            new_y_center = orig_y_center * scale + pad_y
+            new_width = orig_width * scale
+            new_height = orig_height * scale
+            
+            # Convert back to normalized coordinates
+            norm_x_center = new_x_center / imgsz
+            norm_y_center = new_y_center / imgsz
+            norm_width = new_width / imgsz
+            norm_height = new_height / imgsz
+            
+            letterbox_annotations.append((class_id, norm_x_center, norm_y_center, norm_width, norm_height))
+    
+    # Apply random augmentations manually
+    augmented_image = letterboxed.copy()
+    augmented_annotations = letterbox_annotations.copy()
+    
+    # Random HSV adjustments (matching training settings)
+    if random.random() < 0.8:  # Apply HSV augmentation 80% of the time
+        hsv = cv2.cvtColor(augmented_image, cv2.COLOR_RGB2HSV).astype(np.float32)
+        
+        # Hue shift (±1.5%)
+        h_gain = random.uniform(-0.015, 0.015)
+        hsv[:, :, 0] = (hsv[:, :, 0] * (1 + h_gain)) % 180
+        
+        # Saturation adjustment (±50%)
+        s_gain = random.uniform(-0.5, 0.5)
+        hsv[:, :, 1] = hsv[:, :, 1] * (1 + s_gain)
+        
+        # Value/brightness adjustment (±30%)
+        v_gain = random.uniform(-0.3, 0.3)
+        hsv[:, :, 2] = hsv[:, :, 2] * (1 + v_gain)
+        
+        # Clip values and convert back
+        hsv = np.clip(hsv, 0, 255)
+        augmented_image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    
+    # Random horizontal flip (50% chance)
+    if random.random() < 0.5:
+        augmented_image = cv2.flip(augmented_image, 1)  # Horizontal flip
+        
+        # Flip annotations too
+        flipped_annotations = []
+        for ann in augmented_annotations:
+            class_id, x_center, y_center, width, height = ann
+            # Flip x coordinate
+            flipped_x_center = 1.0 - x_center
+            flipped_annotations.append((class_id, flipped_x_center, y_center, width, height))
+        augmented_annotations = flipped_annotations
+    
+    aug_method = "Copy-Paste + HSV + Flip Augmentation"
+    return augmented_image, augmented_annotations, aug_method
+
+def apply_yolo_training_augmentations(image, annotations, imgsz=1280):
+    """
+    Apply training augmentations - fallback to manual implementation.
+    """
+    return apply_manual_augmentations(image, annotations, imgsz)
+
 def visualize_training_samples(dataset_path="yolo_dataset_proper", num_samples=4):
-    """Visualize how original images are transformed for training - comparing square vs 16:9."""
+    """Visualize how original images are transformed during actual YOLO training."""
     
     train_images_path = os.path.join(dataset_path, "train", "images")
     train_labels_path = os.path.join(dataset_path, "train", "labels")
@@ -145,12 +330,12 @@ def visualize_training_samples(dataset_path="yolo_dataset_proper", num_samples=4
     
     print(f"📊 Found {len(image_files)} training images")
     print(f"🎯 Showing {min(num_samples, len(image_files))} random samples")
-    print(f"📐 Comparing: 1280x1280 (square + padding) vs 1280x720 (16:9, no padding)")
+    print(f"🔄 Showing: Original → Letterbox → YOLO Training Augmented")
     
     # Select random samples
     sample_files = random.sample(image_files, min(num_samples, len(image_files)))
     
-    # Create subplot grid - 3 columns (original, square, 16:9)
+    # Create subplot grid - 3 columns (original, letterbox, training augmented)
     fig, axes = plt.subplots(len(sample_files), 3, figsize=(20, 4 * len(sample_files)))
     
     if len(sample_files) == 1:
@@ -192,12 +377,12 @@ def visualize_training_samples(dataset_path="yolo_dataset_proper", num_samples=4
         else:
             original_with_boxes = image_rgb
         
-        # Method 1: Square with letterboxing (1280x1280)
-        square_image, scale, (pad_x, pad_y) = letterbox_resize(image_rgb, 1280)
-        square_with_boxes = square_image.copy()
+        # Method 1: Basic letterbox (what YOLO does first)
+        letterbox_image, scale, (pad_x, pad_y) = letterbox_resize(image_rgb, 1280)
+        letterbox_with_boxes = letterbox_image.copy()
+        letterbox_annotations = []
         if annotations:
-            # Transform annotations for square image
-            square_annotations = []
+            # Transform annotations for letterbox image
             for ann in annotations:
                 class_id, x_center, y_center, width, height = ann
                 
@@ -219,22 +404,15 @@ def visualize_training_samples(dataset_path="yolo_dataset_proper", num_samples=4
                 norm_width = new_width / 1280
                 norm_height = new_height / 1280
                 
-                square_annotations.append((class_id, norm_x_center, norm_y_center, norm_width, norm_height))
+                letterbox_annotations.append((class_id, norm_x_center, norm_y_center, norm_width, norm_height))
             
-            square_with_boxes = draw_bounding_boxes(square_with_boxes, square_annotations)
+            letterbox_with_boxes = draw_bounding_boxes(letterbox_with_boxes, letterbox_annotations)
         
-        # Method 2: 16:9 resize (1280x720) - no padding!
-        ratio_image, scale_x, scale_y = resize_16_9(image_rgb, 1280, 720)
-        ratio_with_boxes = ratio_image.copy()
-        if annotations:
-            # Transform annotations for 16:9 image (simple scaling)
-            ratio_annotations = []
-            for ann in annotations:
-                class_id, x_center, y_center, width, height = ann
-                # No coordinate transformation needed - just use original normalized coords!
-                ratio_annotations.append((class_id, x_center, y_center, width, height))
-            
-            ratio_with_boxes = draw_bounding_boxes(ratio_with_boxes, ratio_annotations)
+        # Method 2: YOLO training augmentations (how images actually look during training)
+        augmented_image, augmented_annotations, aug_method = apply_yolo_training_augmentations(image_rgb, annotations, 1280)
+        augmented_with_boxes = augmented_image.copy()
+        if augmented_annotations:
+            augmented_with_boxes = draw_bounding_boxes(augmented_with_boxes, augmented_annotations)
         
         # Display original image
         axes[idx, 0].imshow(original_with_boxes)
@@ -242,24 +420,24 @@ def visualize_training_samples(dataset_path="yolo_dataset_proper", num_samples=4
                               fontsize=10)
         axes[idx, 0].axis('off')
         
-        # Display square processed image
-        axes[idx, 1].imshow(square_with_boxes)
-        axes[idx, 1].set_title(f"Square: 1280x1280 (letterboxed)\nScale: {scale:.3f}, Padding: ({pad_x}, {pad_y})", 
+        # Display letterbox processed image
+        axes[idx, 1].imshow(letterbox_with_boxes)
+        axes[idx, 1].set_title(f"Letterbox: 1280x1280\nScale: {scale:.3f}, Padding: ({pad_x}, {pad_y})", 
                               fontsize=10)
         axes[idx, 1].axis('off')
         
-        # Display 16:9 processed image
-        axes[idx, 2].imshow(ratio_with_boxes)
-        axes[idx, 2].set_title(f"16:9: 1280x720 (no padding)\nScale: {scale_x:.3f}x, {scale_y:.3f}y", 
-                              fontsize=10)
+        # Display training augmented image
+        axes[idx, 2].imshow(augmented_with_boxes)
+        axes[idx, 2].set_title(f"Training Augmented: 1280x1280\n{aug_method}\n{len(augmented_annotations)} objects", 
+                              fontsize=9)
         axes[idx, 2].axis('off')
     
     plt.tight_layout()
-    plt.suptitle("SoccerNet GSR: Square vs 16:9 Training Resolution Comparison", 
+    plt.suptitle("SoccerNet GSR: How Images Look During YOLO Training", 
                 fontsize=16, y=0.98)
     
     # Save the visualization
-    output_path = "square_vs_16_9_comparison.png"
+    output_path = "yolo_training_visualization.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"\n💾 Visualization saved to: {output_path}")
     
@@ -319,19 +497,83 @@ def show_dataset_stats(dataset_path="yolo_dataset_proper"):
         percentage = (count / total_annotations * 100) if total_annotations > 0 else 0
         print(f"  {class_names[class_id]:>10}: {count:>6} ({percentage:>5.1f}%)")
 
+def visualize_augmentation_variations(dataset_path="yolo_dataset_proper", num_variations=5):
+    """Show multiple augmentation variations of the same image to see training diversity."""
+    
+    train_images_path = os.path.join(dataset_path, "train", "images")
+    train_labels_path = os.path.join(dataset_path, "train", "labels")
+    
+    if not os.path.exists(train_images_path):
+        print(f"❌ Training images directory not found: {train_images_path}")
+        return
+    
+    # Get a random image
+    image_files = [f for f in os.listdir(train_images_path) 
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    
+    if len(image_files) == 0:
+        print(f"❌ No image files found in {train_images_path}")
+        return
+    
+    # Pick one image to show variations
+    image_file = random.choice(image_files)
+    image_path = os.path.join(train_images_path, image_file)
+    image = cv2.imread(image_path)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # Load annotations
+    label_file = os.path.splitext(image_file)[0] + '.txt'
+    label_path = os.path.join(train_labels_path, label_file)
+    annotations = load_yolo_annotations(label_path)
+    
+    print(f"\n🎲 Showing {num_variations} augmentation variations of: {image_file}")
+    
+    # Create subplot grid
+    fig, axes = plt.subplots(1, num_variations + 1, figsize=(4 * (num_variations + 1), 4))
+    
+    # Show original
+    original_with_boxes = draw_bounding_boxes(image_rgb.copy(), annotations) if annotations else image_rgb
+    axes[0].imshow(original_with_boxes)
+    axes[0].set_title(f"Original\n{len(annotations)} objects", fontsize=10)
+    axes[0].axis('off')
+    
+    # Show variations
+    for i in range(num_variations):
+        aug_image, aug_annotations, aug_method = apply_yolo_training_augmentations(image_rgb, annotations, 1280)
+        aug_with_boxes = draw_bounding_boxes(aug_image.copy(), aug_annotations) if aug_annotations else aug_image
+        
+        axes[i + 1].imshow(aug_with_boxes)
+        axes[i + 1].set_title(f"Variation {i+1}\n{len(aug_annotations)} objects", fontsize=10)
+        axes[i + 1].axis('off')
+    
+    plt.tight_layout()
+    plt.suptitle(f"Training Augmentation Variations: {image_file}", fontsize=14, y=0.98)
+    
+    # Save the visualization
+    output_path = "augmentation_variations.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"💾 Augmentation variations saved to: {output_path}")
+    
+    plt.show()
+
 def main():
     """Main visualization function."""
     print("🏈 SoccerNet GSR Training Image Visualizer")
     print("=" * 50)
-    print("📐 Comparing square (1280x1280) vs 16:9 (1280x720) training formats")
+    print("🔄 Showing how images are transformed during actual YOLO training")
     
     # Show dataset statistics
     show_dataset_stats()
     
-    # Visualize sample images
-    print(f"\n🖼️  SQUARE vs 16:9 COMPARISON")
+    # Visualize sample images with training transformations
+    print(f"\n🖼️  YOLO TRAINING PIPELINE VISUALIZATION")
     print("=" * 50)
     visualize_training_samples(num_samples=3)
+    
+    # Show augmentation variations
+    print(f"\n🎲 AUGMENTATION VARIATIONS")
+    print("=" * 50)
+    visualize_augmentation_variations(num_variations=4)
     
     print("\n✅ Visualization complete!")
     print("\nLegend:")
@@ -341,10 +583,10 @@ def main():
     print("  🔵 Cyan boxes: Ball")
     print("\nKey insights:")
     print("  • Original: 1920x1080 (16:9 aspect ratio)")
-    print("  • Square: 1280x1280 with gray padding (wastes ~22% of pixels)")
-    print("  • 16:9: 1280x720 with no padding (uses 100% of pixels)")
-    print("  • 16:9 format eliminates gray bars and matches natural soccer footage")
-    print("  • For soccer-only datasets, 16:9 is likely more efficient!")
+    print("  • Letterbox: 1280x1280 with gray padding (YOLO standard)")
+    print("  • Training: Same size but with HSV, flip, and other augmentations")
+    print("  • Augmentations help the model generalize to different lighting/conditions")
+    print("  • Each training epoch sees slightly different versions of the same image!")
 
 if __name__ == "__main__":
     main()

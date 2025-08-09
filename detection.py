@@ -21,6 +21,7 @@ class TrainingProgressCallback:
         self.current_epoch = 0
         self.total_batches = 0
         self.current_batch = 0
+        self.class_names = {0: 'player', 1: 'goalkeeper', 2: 'referee', 3: 'ball'}
     
     def on_train_start(self, trainer):
         """Called when training starts."""
@@ -91,6 +92,25 @@ class TrainingProgressCallback:
             
             self.epoch_pbar.set_postfix_str(metrics_info)
             self.epoch_pbar.update(1)
+    
+    def on_fit_epoch_end(self, trainer):
+        """Called at the end of each epoch (both training and validation)."""
+        # Show per-class validation metrics if available
+        if hasattr(trainer, 'validator') and trainer.validator and hasattr(trainer.validator, 'metrics'):
+            metrics = trainer.validator.metrics
+            if hasattr(metrics, 'box') and hasattr(metrics.box, 'ap50'):
+                # Get per-class AP@0.5 and AP@0.5:0.95
+                ap50_per_class = metrics.box.ap50
+                ap_per_class = metrics.box.maps  # Fixed: use .maps for per-class AP@0.5:0.95
+                
+                if ap50_per_class is not None and len(ap50_per_class) > 0:
+                    print(f"\n📊 Epoch {self.current_epoch} - Per-Class Validation Metrics:")
+                    print("-" * 55)
+                    for i, (class_id, class_name) in enumerate(self.class_names.items()):
+                        if i < len(ap50_per_class):
+                            ap50 = ap50_per_class[i] if ap50_per_class[i] is not None else 0.0
+                            ap = ap_per_class[i] if ap_per_class is not None and i < len(ap_per_class) and ap_per_class[i] is not None else 0.0
+                            print(f"  {class_name:12} | AP@0.5: {ap50:.4f} | AP@0.5:0.95: {ap:.4f}")
     
     def on_train_end(self, trainer):
         """Called when training ends."""
@@ -211,22 +231,21 @@ def train_yolo_model(
         except:
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
-    
-    
-    # Learning rate tuned for short (3–5 epoch) fine-tunes with AdamW
+
     lr0 = 0.003
-    
+
     # Training arguments with optimizations
     train_args = {
         'data': data_yaml,
         'epochs': epochs,
-        'imgsz': [960, 1088, 1280, 1440],  # Multi-scale training for better scale invariance
+        'imgsz': 1280,  # Base image size
         'batch': batch_size,
         'device': device,
         'project': project,
         'name': name,
         'save_period': save_period,
         'patience': patience,
+        'plots': True,
         'workers': 8,  # More data loading threads
         'amp': True,  # Explicit AMP (already default but explicit)
         'optimizer': 'AdamW',
@@ -234,27 +253,28 @@ def train_yolo_model(
         'lrf': 0.2,
         'momentum': 0.9,
         'weight_decay': 0.0005,
-        'warmup_epochs': 1,
+        'warmup_epochs': 2,
         'cos_lr': True,  
-        'box': 7.5,
-        'cls': 0.5,
-        'dfl': 1.5,
+        'box': 5.0,   # Reduced box loss weight to balance with classification
+        'cls': 1.0,   # Increased class loss weight for better classification
+        'dfl': 1.0,   # Reduced distribution focal loss weight
         'label_smoothing': 0.0,
         'nbs': 64,
         # Enhanced data augmentation tuned for soccer footage (without harmful mosaic)
         'hsv_h': 0.015,
         'hsv_s': 0.5,        # Increased saturation variation
         'hsv_v': 0.3,        # Increased brightness variation
-        'degrees': 15.0,     # Increased rotation to simulate camera movement
-        'translate': 0.15,   # More translation
-        'scale': 0.4,        # More scaling variation
-        'shear': 0.2,        # More shear
-        'perspective': 0.001, # Add light perspective transform
+        'degrees': 5.0,      # Reduced rotation to more realistic camera movement
+        'translate': 0.1,    # Reduced translation
+        'scale': 0.2,        # Reduced scaling variation to prevent extreme sizes
+        'shear': 0.1,        # Reduced shear
+        'perspective': 0.0,  # Disabled perspective transform for more realistic views
         'flipud': 0.0,       # Keep disabled for ground-level views
         'fliplr': 0.5,       # Keep horizontal flip
         'mosaic': 0.0,       # DISABLED: hurts small object detection (balls)
-        'mixup': 0.1,        # Reduced mixup probability
-        'copy_paste': 0.3,   # Enable copy-paste for rare objects like balls
+        'mixup': 0.05,       # Further reduced mixup probability
+        'copy_paste': 0.10,  # Reduced copy-paste probability for more natural distribution
+        'multi_scale': True,  # Enable built-in multi-scale training
         **kwargs
     }
     
@@ -276,6 +296,7 @@ def train_yolo_model(
     model.add_callback('on_train_epoch_start', progress_callback.on_train_epoch_start)
     model.add_callback('on_train_batch_end', progress_callback.on_train_batch_end)
     model.add_callback('on_train_epoch_end', progress_callback.on_train_epoch_end)
+    model.add_callback('on_fit_epoch_end', progress_callback.on_fit_epoch_end)
     model.add_callback('on_train_end', progress_callback.on_train_end)
     
     # Start training with progress tracking
@@ -347,6 +368,27 @@ def validate_model(model_path: str, data_yaml: str, device: str = 'auto', batch_
             pbar.set_postfix_str(metrics_str)
         pbar.update(1)
     
+    # Display per-class metrics
+    if hasattr(results, 'box') and hasattr(results.box, 'ap50'):
+        print("\n📊 Per-Class Validation Metrics:")
+        print("-" * 50)
+        
+        # Get class names from the dataset config
+        class_names = {0: 'player', 1: 'goalkeeper', 2: 'referee', 3: 'ball'}
+        
+        # Get per-class AP@0.5 and AP@0.5:0.95
+        ap50_per_class = results.box.ap50
+        ap_per_class = results.box.maps
+        
+        if ap50_per_class is not None and len(ap50_per_class) > 0:
+            for i, (class_id, class_name) in enumerate(class_names.items()):
+                if i < len(ap50_per_class):
+                    ap50 = ap50_per_class[i] if ap50_per_class[i] is not None else 0.0
+                    ap = ap_per_class[i] if ap_per_class is not None and i < len(ap_per_class) and ap_per_class[i] is not None else 0.0
+                    print(f"  {class_name:12} | AP@0.5: {ap50:.4f} | AP@0.5:0.95: {ap:.4f}")
+        else:
+            print("  Per-class metrics not available")
+    
     print("✅ Validation completed!")
     return results
 
@@ -397,16 +439,16 @@ def main():
         print("Creating dataset configuration...")
         create_dataset_yaml(data_dir, dataset_yaml)
     
-    # Training configuration (optimized for RTX 4090)
+    # Training configuration (optimized for better object classification)
     training_config = {
-        'model_size': 'yolov8l.pt',  # YOLOv8 Medium model for better performance
-        'epochs': 10,
-        'batch_size': 10,  # Reduced for Apple Silicon compatibility
+        'model_size': 'yolov8n.pt',  # YOLOv8 Large model for better performance
+        'epochs': 2,  # Reduced for testing
+        'batch_size': 8,  # Slightly reduced for stability
         'device': 'auto',
         'project': 'runs/detect',
-        'name': 'soccernet_gsr_v8_optimized',
-        'save_period': 10,
-        'patience': 3,
+        'name': 'soccernet_gsr_v8_improved',
+        'save_period': 1,
+        'patience': 5,
     }
     
     print("\n🚀 Starting YOLO training for SoccerNet GSR (with multi-scale training and improved augmentations)...")
@@ -445,8 +487,23 @@ def main():
                     if hasattr(box, 'map50') and hasattr(box, 'map'):
                         print(f"  mAP@0.5: {box.map50:.4f}")
                         print(f"  mAP@0.5:0.95: {box.map:.4f}")
+                    
+                    # Show per-class metrics
+                    class_names = {0: 'player', 1: 'goalkeeper', 2: 'referee', 3: 'ball'}
+                    ap50_per_class = box.ap50
+                    ap_per_class = box.maps
+                    
+                    if ap50_per_class is not None and len(ap50_per_class) > 0:
+                        print(f"\n📊 Per-Class Validation Metrics:")
+                        print("-" * 40)
+                        for i, (class_id, class_name) in enumerate(class_names.items()):
+                            if i < len(ap50_per_class):
+                                ap50 = ap50_per_class[i] if ap50_per_class[i] is not None else 0.0
+                                ap = ap_per_class[i] if ap_per_class is not None and i < len(ap_per_class) and ap_per_class[i] is not None else 0.0
+                                print(f"  {class_name:12} | AP@0.5: {ap50:.4f} | AP@0.5:0.95: {ap:.4f}")
                 if hasattr(val_results, 'speed') and val_results.speed:
                     print(f"  Inference Speed: {val_results.speed['inference']:.2f}ms per image")
+            
         
         print("\n" + "="*50)
         print("🎉 TRAINING SUMMARY")
@@ -455,10 +512,6 @@ def main():
         print(f"⏱️  Epochs: {training_config['epochs']}")
         print(f"📁 Dataset: {data_dir}")
         print(f"🏆 Best weights: {best_model_path}")
-        print("\n📋 Next steps:")
-        print("  1. 📊 Check training results in runs/detect/soccernet_gsr_v8_optimized/")
-        print("  2. 🔮 Use best.pt for inference")
-        print("  3. 🎯 Implement tracking and other components")
         
     except KeyboardInterrupt:
         print("\n⏹️  Training interrupted by user")
