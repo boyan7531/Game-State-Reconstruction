@@ -235,6 +235,7 @@ def train_yolo_model(
         'momentum': 0.9,
         'weight_decay': 0.0005,
         'warmup_epochs': 1,
+        'cos_lr': True,  
         'box': 7.5,
         'cls': 0.5,
         'dfl': 1.5,
