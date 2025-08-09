@@ -216,16 +216,11 @@ def train_yolo_model(
     # Learning rate tuned for short (3–5 epoch) fine-tunes with AdamW
     lr0 = 0.003
     
-    # Choose when to stop using mosaic augmentation based on total epochs
-    # For short runs, stop around halfway; for >=20 epochs, stop at epoch 10
-    close_mosaic_epoch = 10 if epochs >= 20 else max(1, int(epochs / 2))
-    
-    
     # Training arguments with optimizations
     train_args = {
         'data': data_yaml,
         'epochs': epochs,
-        'imgsz': imgsz,
+        'imgsz': [960, 1088, 1280, 1440],  # Multi-scale training for better scale invariance
         'batch': batch_size,
         'device': device,
         'project': project,
@@ -245,21 +240,20 @@ def train_yolo_model(
         'dfl': 1.5,
         'label_smoothing': 0.0,
         'nbs': 64,
-        # Light data augmentation tuned for soccer footage
+        # Enhanced data augmentation tuned for soccer footage (without harmful mosaic)
         'hsv_h': 0.015,
-        'hsv_s': 0.4,
-        'hsv_v': 0.2,
-        'degrees': 5.0,
-        'translate': 0.06,
-        'scale': 0.2,
-        'shear': 0.05,
-        'perspective': 0.0,
-        'flipud': 0.0,
-        'fliplr': 0.5,
-        'mosaic': 0.2,
-        'mixup': 0.05,
-        'copy_paste': 0.0,
-        'close_mosaic': close_mosaic_epoch,
+        'hsv_s': 0.5,        # Increased saturation variation
+        'hsv_v': 0.3,        # Increased brightness variation
+        'degrees': 15.0,     # Increased rotation to simulate camera movement
+        'translate': 0.15,   # More translation
+        'scale': 0.4,        # More scaling variation
+        'shear': 0.2,        # More shear
+        'perspective': 0.001, # Add light perspective transform
+        'flipud': 0.0,       # Keep disabled for ground-level views
+        'fliplr': 0.5,       # Keep horizontal flip
+        'mosaic': 0.0,       # DISABLED: hurts small object detection (balls)
+        'mixup': 0.1,        # Reduced mixup probability
+        'copy_paste': 0.3,   # Enable copy-paste for rare objects like balls
         **kwargs
     }
     
@@ -330,7 +324,7 @@ def validate_model(model_path: str, data_yaml: str, device: str = 'auto', batch_
         'data': data_yaml,
         'device': device,
         'batch': batch_size,  # Larger batch size for faster validation
-        'imgsz': 1280,        # Match training image size
+        'imgsz': 1280,        # Use middle value for consistent validation
         'workers': 8,         # Parallel data loading
         'verbose': True,      # Show detailed progress
         **kwargs
@@ -404,22 +398,32 @@ def main():
     
     # Training configuration (optimized for RTX 4090)
     training_config = {
-        'model_size': 'yolov8l.pt',  # YOLOv12 Large model for better performance
+        'model_size': 'yolov8l.pt',  # YOLOv8 Medium model for better performance
         'epochs': 10,
-        'imgsz': 1280,
-        'batch_size': 10,  # Optimized for RTX 4090 (24GB VRAM)
+        'batch_size': 10,  # Reduced for Apple Silicon compatibility
         'device': 'auto',
         'project': 'runs/detect',
-        'name': 'soccernet_gsr_v12_optimized',
+        'name': 'soccernet_gsr_v8_optimized',
         'save_period': 10,
         'patience': 3,
     }
     
-    print("\n🚀 Starting YOLO training for SoccerNet GSR...")
+    print("\n🚀 Starting YOLO training for SoccerNet GSR (with multi-scale training and improved augmentations)...")
     
     try:
         # Train model
-        results, model = train_yolo_model(dataset_yaml, **training_config)
+        results, _ = train_yolo_model(dataset_yaml, **training_config)
+        
+        # Display some key training results
+        if results and hasattr(results, 'results_dict'):
+            print(f"\n📈 Key Training Metrics:")
+            results_dict = results.results_dict
+            if 'train/box_loss' in results_dict:
+                print(f"  Final Box Loss: {results_dict['train/box_loss']:.4f}")
+            if 'train/cls_loss' in results_dict:
+                print(f"  Final Class Loss: {results_dict['train/cls_loss']:.4f}")
+            if 'metrics/mAP50(B)' in results_dict:
+                print(f"  Best mAP@0.5: {results_dict['metrics/mAP50(B)']:.4f}")
         
         # Validate model
         best_model_path = f"{training_config['project']}/{training_config['name']}/weights/best.pt"
@@ -431,6 +435,17 @@ def main():
                 device=training_config['device'],
                 batch_size=min(training_config['batch_size'] * 2, 64)  # Larger batch for validation
             )
+            
+            # Display validation results
+            if val_results:
+                print(f"\n📈 Validation Results:")
+                if hasattr(val_results, 'box'):
+                    box = val_results.box
+                    if hasattr(box, 'map50') and hasattr(box, 'map'):
+                        print(f"  mAP@0.5: {box.map50:.4f}")
+                        print(f"  mAP@0.5:0.95: {box.map:.4f}")
+                if hasattr(val_results, 'speed') and val_results.speed:
+                    print(f"  Inference Speed: {val_results.speed['inference']:.2f}ms per image")
         
         print("\n" + "="*50)
         print("🎉 TRAINING SUMMARY")
@@ -440,12 +455,26 @@ def main():
         print(f"📁 Dataset: {data_dir}")
         print(f"🏆 Best weights: {best_model_path}")
         print("\n📋 Next steps:")
-        print("  1. 📊 Check training results in runs/detect/soccernet_gsr_v1/")
+        print("  1. 📊 Check training results in runs/detect/soccernet_gsr_v8_optimized/")
         print("  2. 🔮 Use best.pt for inference")
         print("  3. 🎯 Implement tracking and other components")
         
     except KeyboardInterrupt:
         print("\n⏹️  Training interrupted by user")
+    except RuntimeError as e:
+        if "MPS backend out of memory" in str(e):
+            print("\n❌ Training failed due to insufficient GPU memory.")
+            print("🔧 Troubleshooting tips:")
+            print("  1. Reduce batch_size in training_config (currently {})".format(training_config['batch_size']))
+            print("  2. Try a smaller model (yolov8m.pt or yolov8s.pt instead of yolov8l.pt)")
+            print("  3. Use CPU instead of MPS by setting device='cpu' in training_config")
+        else:
+            print(f"\n❌ Training failed with error: {e}")
+            print("\n🔧 Troubleshooting tips:")
+            print("  1. Check GPU memory (reduce batch_size if needed)")
+            print("  2. Verify dataset format and paths")
+            print("  3. Check CUDA/PyTorch installation")
+        raise
     except Exception as e:
         print(f"\n❌ Training failed with error: {e}")
         print("\n🔧 Troubleshooting tips:")
