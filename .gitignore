@@ -15,3 +15,7 @@ soccernet_dataset_test.yaml
 yolo_dataset_subset_10k
 visualize_training_images.py
 visualize_training_images.py
+soccernet_gsr_v8_improved2
+soccernet_gsr_yolo12s_tuned19
+*.txt
+weights

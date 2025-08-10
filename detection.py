@@ -6,6 +6,7 @@ Trains YOLOv8 model on the converted SoccerNet GSR dataset.
 
 import os
 import yaml
+import argparse
 from pathlib import Path
 from ultralytics import YOLO
 import torch
@@ -162,6 +163,7 @@ def train_yolo_model(
     save_period: int = 10,
     patience: int = 50,
     dataset_size: int = None,
+    use_augmentations: bool = True,
     **kwargs
 ):
     """
@@ -179,6 +181,7 @@ def train_yolo_model(
         save_period: Save checkpoint every N epochs
         patience: Early stopping patience
         dataset_size: Number of training images (auto-detected if None)
+        use_augmentations: Whether to use data augmentations (True) or not (False)
         **kwargs: Additional training arguments
     """
     
@@ -255,28 +258,55 @@ def train_yolo_model(
         'weight_decay': 0.0005,
         'warmup_epochs': 2,
         'cos_lr': True,  
-        'box': 5.0,   # Reduced box loss weight to balance with classification
-        'cls': 1.0,   # Increased class loss weight for better classification
-        'dfl': 1.0,   # Reduced distribution focal loss weight
+        'box': 6.0,
+        'cls': 1.2,
+        'dfl': 1.4,
         'label_smoothing': 0.0,
         'nbs': 64,
-        # Enhanced data augmentation tuned for soccer footage (without harmful mosaic)
-        'hsv_h': 0.015,
-        'hsv_s': 0.5,        # Increased saturation variation
-        'hsv_v': 0.3,        # Increased brightness variation
-        'degrees': 5.0,      # Reduced rotation to more realistic camera movement
-        'translate': 0.1,    # Reduced translation
-        'scale': 0.2,        # Reduced scaling variation to prevent extreme sizes
-        'shear': 0.1,        # Reduced shear
-        'perspective': 0.0,  # Disabled perspective transform for more realistic views
-        'flipud': 0.0,       # Keep disabled for ground-level views
-        'fliplr': 0.5,       # Keep horizontal flip
-        'mosaic': 0.0,       # DISABLED: hurts small object detection (balls)
-        'mixup': 0.05,       # Further reduced mixup probability
-        'copy_paste': 0.10,  # Reduced copy-paste probability for more natural distribution
-        'multi_scale': True,  # Enable built-in multi-scale training
         **kwargs
     }
+    
+    # Add augmentations conditionally based on flag
+    if use_augmentations:
+        print("🎨 Using enhanced data augmentations")
+        augmentation_args = {
+            # Enhanced data augmentation tuned for soccer footage (without harmful mosaic)
+            'hsv_h': 0.015,
+            'hsv_s': 0.5,       
+            'hsv_v': 0.3,       
+            'degrees': 5.0,     
+            'translate': 0.1,   
+            'scale': 0.2,       
+            'shear': 0.1,       
+            'perspective': 0.0, 
+            'flipud': 0.0,      
+            'fliplr': 0.5,      
+            'mosaic': 0.0,      
+            'mixup': 0.05,      
+            'copy_paste': 0.10, 
+            'multi_scale': True,
+        }
+        train_args.update(augmentation_args)
+    else:
+        print("🚫 Training without data augmentations")
+        # Disable all augmentations
+        no_augmentation_args = {
+            'hsv_h': 0.0,
+            'hsv_s': 0.0,       
+            'hsv_v': 0.0,       
+            'degrees': 0.0,     
+            'translate': 0.0,   
+            'scale': 0.0,       
+            'shear': 0.0,       
+            'perspective': 0.0, 
+            'flipud': 0.0,      
+            'fliplr': 0.0,      
+            'mosaic': 0.0,      
+            'mixup': 0.0,      
+            'copy_paste': 0.0, 
+            'multi_scale': False,
+        }
+        train_args.update(no_augmentation_args)
     
     print("📋 Training configuration:")
     key_params = ['epochs', 'batch', 'imgsz', 'device', 'optimizer', 'lr0']
@@ -396,6 +426,22 @@ def main():
     """
     Main training pipeline with enhanced progress tracking.
     """
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='YOLO Training Script for SoccerNet Game State Reconstruction')
+    parser.add_argument('--no-augmentations', action='store_true', 
+                       help='Disable data augmentations during training')
+    parser.add_argument('--epochs', type=int, default=2,
+                       help='Number of training epochs (default: 2)')
+    parser.add_argument('--batch-size', type=int, default=8,
+                       help='Batch size for training (default: 8)')
+    parser.add_argument('--model', type=str, default='yolov8n.pt',
+                       help='YOLO model size (default: yolov8n.pt)')
+    parser.add_argument('--name', type=str, default='soccernet_gsr_v8_improved',
+                       help='Experiment name (default: soccernet_gsr_v8_improved)')
+    
+    args = parser.parse_args()
+    use_augmentations = not args.no_augmentations
+    
     # Configuration
     data_dir = "yolo_dataset_proper"
     dataset_yaml = "soccernet_dataset.yaml"
@@ -440,18 +486,21 @@ def main():
         create_dataset_yaml(data_dir, dataset_yaml)
     
     # Training configuration (optimized for better object classification)
+    experiment_name = f"{args.name}{'_no_aug' if not use_augmentations else '_with_aug'}"
     training_config = {
-        'model_size': 'yolov8n.pt',  # YOLOv8 Large model for better performance
-        'epochs': 2,  # Reduced for testing
-        'batch_size': 8,  # Slightly reduced for stability
+        'model_size': args.model,
+        'epochs': args.epochs,
+        'batch_size': args.batch_size,
         'device': 'auto',
         'project': 'runs/detect',
-        'name': 'soccernet_gsr_v8_improved',
+        'name': experiment_name,
         'save_period': 1,
         'patience': 5,
+        'use_augmentations': use_augmentations,
     }
     
-    print("\n🚀 Starting YOLO training for SoccerNet GSR (with multi-scale training and improved augmentations)...")
+    augmentation_status = "with augmentations" if use_augmentations else "without augmentations"
+    print(f"\n🚀 Starting YOLO training for SoccerNet GSR ({augmentation_status})...")
     
     try:
         # Train model
