@@ -235,7 +235,7 @@ def train_yolo_model(
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
 
-    lr0 = 0.001  
+    lr0 = 0.005  # Increased learning rate for better convergence  
 
     # Training arguments with optimizations
     train_args = {
@@ -252,15 +252,15 @@ def train_yolo_model(
         'amp': True,  
         'optimizer': 'AdamW',
         'lr0': lr0,
-        'lrf': 0.1, 
+        'lrf': 0.05,  # Less aggressive learning rate decay
         'momentum': 0.9,
         'weight_decay': 0.0005,
-        'warmup_epochs': 3, 
+        'warmup_epochs': 5,  # Extended warmup for better stability
         'cos_lr': True,  
-        'box': 6.0,
-        'cls': 1.2,
-        'dfl': 1.4,
-        'label_smoothing': 0.0,
+        'box': 3.0,  # Reduced box loss weight for better balance
+        'cls': 2.0,  # Increased classification loss weight
+        'dfl': 1.5,  # Slightly increased DFL loss weight
+        'label_smoothing': 0.1,  # Enable label smoothing for better generalization
         'nbs': 64,
         **kwargs
     }
@@ -269,21 +269,23 @@ def train_yolo_model(
     if use_augmentations:
         print("🎨 Using enhanced data augmentations")
         augmentation_args = {
-            # Enhanced data augmentation tuned for soccer footage (without harmful mosaic)
-            'hsv_h': 0.015,
-            'hsv_s': 0.5,       
-            'hsv_v': 0.3,       
-            'degrees': 5.0,     
-            'translate': 0.1,   
-            'scale': 0.2,       
-            'shear': 0.1,       
-            'perspective': 0.0, 
-            'flipud': 0.0,      
-            'fliplr': 0.5,      
-            'mosaic': 0.0,      
-            'mixup': 0.05,      
-            'copy_paste': 0.10, 
-            'multi_scale': True,
+            # Enhanced data augmentation tuned for soccer footage (optimized for mAP improvement)
+            'hsv_h': 0.015,     # Color hue variation
+            'hsv_s': 0.7,       # Saturation variation (increased for better generalization)
+            'hsv_v': 0.4,       # Value/brightness variation (increased)
+            'degrees': 10.0,    # Rotation (increased for more variation)
+            'translate': 0.1,   # Translation
+            'scale': 0.3,       # Scale variation (increased for better object size diversity)
+            'shear': 0.1,       # Shear transformation
+            'perspective': 0.0, # Keep zero for soccer (maintains field geometry)
+            'flipud': 0.0,      # No vertical flip (soccer field orientation matters)
+            'fliplr': 0.5,      # Horizontal flip (soccer is symmetric)
+            'mosaic': 0.0,      # Keep disabled (memory intensive at 1280px)
+            'mixup': 0.1,       # Advanced augmentation (increased)
+            'copy_paste': 0.05, # Copy-paste augmentation (reduced to avoid artifacts)
+            'multi_scale': True, # Enable multi-scale training
+            'rect': True,       # Enable rectangular training (efficient batching)
+            'close_mosaic': 10, # Disable mosaic in final epochs
         }
         train_args.update(augmentation_args)
     else:
@@ -429,8 +431,8 @@ def main():
     parser = argparse.ArgumentParser(description='YOLO Training Script for SoccerNet Game State Reconstruction')
     parser.add_argument('--no-augmentations', action='store_true', 
                        help='Disable data augmentations during training')
-    parser.add_argument('--epochs', type=int, default=2,
-                       help='Number of training epochs (default: 2)')
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Number of training epochs (default: 50)')
     parser.add_argument('--batch-size', type=int, default=8,
                        help='Batch size for training (default: 8)')
     parser.add_argument('--model', type=str, default='yolov8n.pt',
@@ -493,8 +495,8 @@ def main():
         'device': 'auto',
         'project': 'runs/detect',
         'name': experiment_name,
-        'save_period': 1,
-        'patience': 5,
+        'save_period': 10,  # Save less frequently to reduce I/O overhead
+        'patience': 25,     # Increased patience for longer training
         'use_augmentations': use_augmentations,
     }
     
