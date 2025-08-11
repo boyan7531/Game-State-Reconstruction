@@ -19,3 +19,4 @@ soccernet_gsr_v8_improved2
 soccernet_gsr_yolo12s_tuned19
 *.txt
 weights
+12s_16batch_no_aug

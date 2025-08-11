@@ -235,7 +235,7 @@ def train_yolo_model(
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
 
-    lr0 = 0.003
+    lr0 = 0.001  
 
     # Training arguments with optimizations
     train_args = {
@@ -248,15 +248,14 @@ def train_yolo_model(
         'name': name,
         'save_period': save_period,
         'patience': patience,
-        'plots': True,
-        'workers': 8,  # More data loading threads
-        'amp': True,  # Explicit AMP (already default but explicit)
+        'workers': 8, 
+        'amp': True,  
         'optimizer': 'AdamW',
         'lr0': lr0,
-        'lrf': 0.2,
+        'lrf': 0.1, 
         'momentum': 0.9,
         'weight_decay': 0.0005,
-        'warmup_epochs': 2,
+        'warmup_epochs': 3, 
         'cos_lr': True,  
         'box': 6.0,
         'cls': 1.2,
