@@ -156,7 +156,7 @@ def train_yolo_model(
     model_size: str = 'yolo12l.pt',
     epochs: int = 100,
     imgsz: int = 640,
-    batch_size: int = 52,
+    batch_size: int = 4,
     device: str = 'auto',
     project: str = 'runs/detect',
     name: str = 'soccernet_gsr',
@@ -235,7 +235,7 @@ def train_yolo_model(
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
 
-    lr0 = 0.005  # Increased learning rate for better convergence  
+    lr0 = 0.002  # Balanced learning rate for stability and performance  
 
     # Training arguments with optimizations
     train_args = {
@@ -252,14 +252,14 @@ def train_yolo_model(
         'amp': True,  
         'optimizer': 'AdamW',
         'lr0': lr0,
-        'lrf': 0.05,  # Less aggressive learning rate decay
+        'lrf': 0.01,  # Conservative learning rate decay for stability
         'momentum': 0.9,
         'weight_decay': 0.0005,
         'warmup_epochs': 5,  # Extended warmup for better stability
         'cos_lr': True,  
-        'box': 3.0,  # Reduced box loss weight for better balance
-        'cls': 2.0,  # Increased classification loss weight
-        'dfl': 1.5,  # Slightly increased DFL loss weight
+        'box': 4.0,  # Optimized box loss weight for better detection
+        'cls': 1.5,  # Balanced classification loss weight
+        'dfl': 1.2,  # Optimized DFL loss weight
         'label_smoothing': 0.1,  # Enable label smoothing for better generalization
         'nbs': 64,
         **kwargs
@@ -269,20 +269,20 @@ def train_yolo_model(
     if use_augmentations:
         print("🎨 Using enhanced data augmentations")
         augmentation_args = {
-            # Enhanced data augmentation tuned for soccer footage (optimized for mAP improvement)
-            'hsv_h': 0.015,     # Color hue variation
-            'hsv_s': 0.7,       # Saturation variation (increased for better generalization)
-            'hsv_v': 0.4,       # Value/brightness variation (increased)
-            'degrees': 10.0,    # Rotation (increased for more variation)
-            'translate': 0.1,   # Translation
-            'scale': 0.3,       # Scale variation (increased for better object size diversity)
-            'shear': 0.1,       # Shear transformation
+            # Balanced data augmentation for stability and performance
+            'hsv_h': 0.01,      # Reduced color hue variation for stability
+            'hsv_s': 0.4,       # Moderate saturation variation
+            'hsv_v': 0.2,       # Conservative brightness variation
+            'degrees': 5.0,     # Reduced rotation to prevent instability
+            'translate': 0.05,  # Conservative translation
+            'scale': 0.2,       # Moderate scale variation
+            'shear': 0.05,      # Reduced shear transformation
             'perspective': 0.0, # Keep zero for soccer (maintains field geometry)
             'flipud': 0.0,      # No vertical flip (soccer field orientation matters)
             'fliplr': 0.5,      # Horizontal flip (soccer is symmetric)
             'mosaic': 0.0,      # Keep disabled (memory intensive at 1280px)
-            'mixup': 0.1,       # Advanced augmentation (increased)
-            'copy_paste': 0.05, # Copy-paste augmentation (reduced to avoid artifacts)
+            'mixup': 0.05,      # Reduced mixup to prevent NaN crashes
+            'copy_paste': 0.02, # Minimal copy-paste to avoid artifacts
             'multi_scale': True, # Enable multi-scale training
             'rect': True,       # Enable rectangular training (efficient batching)
             'close_mosaic': 10, # Disable mosaic in final epochs
@@ -431,14 +431,14 @@ def main():
     parser = argparse.ArgumentParser(description='YOLO Training Script for SoccerNet Game State Reconstruction')
     parser.add_argument('--no-augmentations', action='store_true', 
                        help='Disable data augmentations during training')
-    parser.add_argument('--epochs', type=int, default=50,
-                       help='Number of training epochs (default: 50)')
-    parser.add_argument('--batch-size', type=int, default=8,
-                       help='Batch size for training (default: 8)')
-    parser.add_argument('--model', type=str, default='yolov8n.pt',
-                       help='YOLO model size (default: yolov8n.pt)')
-    parser.add_argument('--name', type=str, default='soccernet_gsr_v8_improved',
-                       help='Experiment name (default: soccernet_gsr_v8_improved)')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of training epochs (default: 100)')
+    parser.add_argument('--batch-size', type=int, default=4,
+                       help='Batch size for training (default: 4)')
+    parser.add_argument('--model', type=str, default='yolo12l.pt',
+                       help='YOLO model size (default: yolo12l.pt)')
+    parser.add_argument('--name', type=str, default='target_60_map_yolo12l',
+                       help='Experiment name (default: target_60_map_yolo12l)')
     
     args = parser.parse_args()
     use_augmentations = not args.no_augmentations

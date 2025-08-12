@@ -21,3 +21,4 @@ soccernet_gsr_yolo12s_tuned19
 weights
 12s_16batch_no_aug
 v100_12s_10b_no_aug
+test_run_50e_with_aug3
