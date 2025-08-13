@@ -5,7 +5,7 @@ runs/
 yolo_dataset_proper
 *.zip
 *.pt
-test.py
+# test.py
 results-2.csv
 *.csv
 test_results/
@@ -22,3 +22,9 @@ weights
 12s_16batch_no_aug
 v100_12s_10b_no_aug
 test_run_50e_with_aug3
+test_video.mp4
+checkpoints/
+models/
+.claude
+results/
+debug_iou.py

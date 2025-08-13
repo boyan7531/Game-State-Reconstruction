@@ -153,10 +153,10 @@ def create_dataset_yaml(data_dir: str, output_path: str = "dataset.yaml"):
 
 def train_yolo_model(
     data_yaml: str,
-    model_size: str = 'yolo12l.pt',
+    model_size: str = 'yolo8l.pt',
     epochs: int = 100,
     imgsz: int = 640,
-    batch_size: int = 4,
+    batch_size: int = 8,
     device: str = 'auto',
     project: str = 'runs/detect',
     name: str = 'soccernet_gsr',
@@ -235,7 +235,7 @@ def train_yolo_model(
             dataset_size = 5000  # fallback estimate
             print(f"⚠️  Could not estimate dataset size, using fallback: {dataset_size}")
 
-    lr0 = 0.002  # Balanced learning rate for stability and performance  
+    lr0 = 0.003  # Proven learning rate from successful runs  
 
     # Training arguments with optimizations
     train_args = {
@@ -247,19 +247,19 @@ def train_yolo_model(
         'project': project,
         'name': name,
         'save_period': save_period,
-        'patience': patience,
+        'patience': 35,  # Increased patience for 0.6+ mAP target,
         'workers': 8, 
         'amp': True,  
         'optimizer': 'AdamW',
         'lr0': lr0,
-        'lrf': 0.01,  # Conservative learning rate decay for stability
+        'lrf': 0.2,  # Exact LR decay from successful runs
         'momentum': 0.9,
         'weight_decay': 0.0005,
-        'warmup_epochs': 5,  # Extended warmup for better stability
+        'warmup_epochs': 2,  # Exact warmup from successful runs
         'cos_lr': True,  
-        'box': 4.0,  # Optimized box loss weight for better detection
-        'cls': 1.5,  # Balanced classification loss weight
-        'dfl': 1.2,  # Optimized DFL loss weight
+        'box': 5.0,  # Exact box weight from successful runs
+        'cls': 1.0,  # Exact cls weight from successful runs
+        'dfl': 1.0,  # Exact DFL weight from successful runs
         'label_smoothing': 0.1,  # Enable label smoothing for better generalization
         'nbs': 64,
         **kwargs
@@ -269,20 +269,20 @@ def train_yolo_model(
     if use_augmentations:
         print("🎨 Using enhanced data augmentations")
         augmentation_args = {
-            # Balanced data augmentation for stability and performance
-            'hsv_h': 0.01,      # Reduced color hue variation for stability
-            'hsv_s': 0.4,       # Moderate saturation variation
-            'hsv_v': 0.2,       # Conservative brightness variation
-            'degrees': 5.0,     # Reduced rotation to prevent instability
-            'translate': 0.05,  # Conservative translation
-            'scale': 0.2,       # Moderate scale variation
-            'shear': 0.05,      # Reduced shear transformation
+            # Exact augmentations from successful runs
+            'hsv_h': 0.015,     # Exact HSV H from successful runs
+            'hsv_s': 0.5,       # Exact HSV S from successful runs
+            'hsv_v': 0.3,       # Exact HSV V from successful runs
+            'degrees': 5.0,     # Exact rotation from successful runs
+            'translate': 0.1,   # Exact translation from successful runs
+            'scale': 0.2,       # Exact scale from successful runs
+            'shear': 0.1,       # Exact shear from successful runs
             'perspective': 0.0, # Keep zero for soccer (maintains field geometry)
             'flipud': 0.0,      # No vertical flip (soccer field orientation matters)
             'fliplr': 0.5,      # Horizontal flip (soccer is symmetric)
             'mosaic': 0.0,      # Keep disabled (memory intensive at 1280px)
-            'mixup': 0.05,      # Reduced mixup to prevent NaN crashes
-            'copy_paste': 0.02, # Minimal copy-paste to avoid artifacts
+            'mixup': 0.05,      # Exact mixup from successful runs
+            'copy_paste': 0.1,  # Exact copy-paste from successful runs
             'multi_scale': True, # Enable multi-scale training
             'rect': True,       # Enable rectangular training (efficient batching)
             'close_mosaic': 10, # Disable mosaic in final epochs
@@ -433,12 +433,12 @@ def main():
                        help='Disable data augmentations during training')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs (default: 100)')
-    parser.add_argument('--batch-size', type=int, default=4,
-                       help='Batch size for training (default: 4)')
-    parser.add_argument('--model', type=str, default='yolo12l.pt',
-                       help='YOLO model size (default: yolo12l.pt)')
-    parser.add_argument('--name', type=str, default='target_60_map_yolo12l',
-                       help='Experiment name (default: target_60_map_yolo12l)')
+    parser.add_argument('--batch-size', type=int, default=8,
+                       help='Batch size for training (default: 8)')
+    parser.add_argument('--model', type=str, default='yolo8l.pt',
+                       help='YOLO model size (default: yolo8l.pt)')
+    parser.add_argument('--name', type=str, default='proven_hyperparams_yolo8l',
+                       help='Experiment name (default: proven_hyperparams_yolo8l)')
     
     args = parser.parse_args()
     use_augmentations = not args.no_augmentations
@@ -496,7 +496,7 @@ def main():
         'project': 'runs/detect',
         'name': experiment_name,
         'save_period': 10,  # Save less frequently to reduce I/O overhead
-        'patience': 25,     # Increased patience for longer training
+        'patience': 35,     # Increased patience for 0.6+ mAP target
         'use_augmentations': use_augmentations,
     }
     
