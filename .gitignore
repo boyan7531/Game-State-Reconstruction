@@ -28,3 +28,4 @@ models/
 .claude
 results/
 debug_iou.py
+pitch_segmentation_20250813_142429_best.pth

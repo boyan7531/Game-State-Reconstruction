@@ -144,27 +144,90 @@ class DiceLoss(nn.Module):
         return 1 - dice
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: float = 1.0, gamma: float = 2.0, reduction: str = 'mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Clamp predictions to avoid log(0)
+        pred = torch.clamp(pred, 1e-8, 1 - 1e-8)
+        
+        # Compute focal loss
+        ce_loss = -(target * torch.log(pred) + (1 - target) * torch.log(1 - pred))
+        p_t = torch.where(target == 1, pred, 1 - pred)
+        focal_weight = self.alpha * (1 - p_t) ** self.gamma
+        focal_loss = focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+class WeightedBCELoss(nn.Module):
+    def __init__(self, pos_weight: Optional[torch.Tensor] = None):
+        super(WeightedBCELoss, self).__init__()
+        self.pos_weight = pos_weight
+        
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Use pos_weight to handle class imbalance
+        loss = nn.functional.binary_cross_entropy(pred, target, weight=None, reduction='none')
+        
+        if self.pos_weight is not None:
+            # Apply positive weight to positive samples
+            pos_weight = self.pos_weight.to(pred.device)
+            loss = loss * (target * pos_weight + (1 - target))
+        
+        return loss.mean()
+
+
 class CombinedLoss(nn.Module):
-    def __init__(self, bce_weight: float = 0.5, dice_weight: float = 0.5):
+    def __init__(
+        self, 
+        loss_type: str = 'focal_dice',
+        focal_weight: float = 0.2, 
+        dice_weight: float = 0.8,
+        focal_alpha: float = 1.0,
+        focal_gamma: float = 2.0,
+        pos_weight: Optional[torch.Tensor] = None
+    ):
         super(CombinedLoss, self).__init__()
-        self.bce_weight = bce_weight
+        self.loss_type = loss_type
+        self.focal_weight = focal_weight
         self.dice_weight = dice_weight
-        self.bce_loss = nn.BCELoss()
-        self.dice_loss = DiceLoss()
+        
+        if loss_type == 'focal_dice':
+            self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+            self.dice_loss = DiceLoss()
+        elif loss_type == 'weighted_bce_dice':
+            self.bce_loss = WeightedBCELoss(pos_weight=pos_weight)
+            self.dice_loss = DiceLoss()
+        else:  # fallback to original
+            self.bce_loss = nn.BCELoss()
+            self.dice_loss = DiceLoss()
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # Ensure predictions are in valid range [0, 1]
-        pred = torch.clamp(pred, 0., 1.)
+        pred = torch.clamp(pred, 1e-8, 1 - 1e-8)
         target = torch.clamp(target, 0., 1.)
         
-        bce = self.bce_loss(pred, target)
         dice = self.dice_loss(pred, target)
         
-        # Validate that individual losses are positive
-        if bce < 0 or dice < 0:
-            logger.warning(f"Invalid loss values: BCE={bce.item():.4f}, Dice={dice.item():.4f}")
+        if self.loss_type == 'focal_dice':
+            focal = self.focal_loss(pred, target)
+            combined = self.focal_weight * focal + self.dice_weight * dice
+        elif self.loss_type == 'weighted_bce_dice':
+            bce = self.bce_loss(pred, target)
+            combined = self.focal_weight * bce + self.dice_weight * dice
+        else:  # fallback
+            bce = self.bce_loss(pred, target)
+            combined = 0.5 * bce + 0.5 * dice
         
-        combined = self.bce_weight * bce + self.dice_weight * dice
         return combined
 
 
@@ -203,6 +266,37 @@ class SegmentationMetrics:
             'iou': iou,
             'accuracy': accuracy
         }
+
+
+def calculate_pos_weight(train_loader: DataLoader, device: str = 'cuda') -> torch.Tensor:
+    """Calculate positive weight for class imbalance from training data."""
+    logger.info("Calculating positive weight for class balancing...")
+    
+    total_positive = 0
+    total_pixels = 0
+    
+    # Sample a subset of the data to estimate class distribution
+    max_batches = min(50, len(train_loader))  # Sample up to 50 batches
+    
+    with torch.no_grad():
+        for i, batch in enumerate(train_loader):
+            if i >= max_batches:
+                break
+                
+            masks = batch['mask']
+            total_positive += masks.sum().item()
+            total_pixels += masks.numel()
+    
+    positive_ratio = total_positive / total_pixels
+    negative_ratio = 1.0 - positive_ratio
+    
+    # pos_weight = (# negative samples) / (# positive samples)
+    pos_weight = negative_ratio / max(positive_ratio, 1e-8)
+    
+    logger.info(f"Class distribution - Positive: {positive_ratio:.6f}, Negative: {negative_ratio:.6f}")
+    logger.info(f"Calculated pos_weight: {pos_weight:.4f}")
+    
+    return torch.tensor(pos_weight, dtype=torch.float32, device=device)
 
 
 class Trainer:
@@ -379,7 +473,11 @@ class Trainer:
             
             # Update learning rate
             if self.scheduler:
-                self.scheduler.step()
+                # ReduceLROnPlateau needs validation metric
+                if hasattr(self.scheduler, 'step') and 'ReduceLROnPlateau' in str(type(self.scheduler)):
+                    self.scheduler.step(val_metrics['iou'])  # Use IoU for plateau detection
+                else:
+                    self.scheduler.step()
             
             # Check for best model
             val_iou = val_metrics['iou']
@@ -414,13 +512,26 @@ def main():
                        help='Model backbone')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--target-size', type=int, nargs=2, default=[512, 512], help='Target image size')
     parser.add_argument('--num-workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], help='Device to use')
     parser.add_argument('--log-dir', type=str, default='runs', help='TensorBoard log directory')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Checkpoint directory')
+    
+    # Loss function configuration
+    parser.add_argument('--loss-type', type=str, default='focal_dice', 
+                       choices=['focal_dice', 'weighted_bce_dice', 'original'],
+                       help='Type of loss function to use')
+    parser.add_argument('--focal-weight', type=float, default=0.2, 
+                       help='Weight for focal/BCE loss component')
+    parser.add_argument('--dice-weight', type=float, default=0.8, 
+                       help='Weight for dice loss component')
+    parser.add_argument('--focal-gamma', type=float, default=2.0, 
+                       help='Gamma parameter for focal loss')
+    parser.add_argument('--line-thickness', type=int, default=8, 
+                       help='Line thickness for pitch mask generation')
     
     args = parser.parse_args()
     
@@ -441,6 +552,15 @@ def main():
     
     logger.info(f"Using device: {device}")
     
+    # Log training improvements
+    logger.info("=== TRAINING IMPROVEMENTS ===")
+    logger.info(f"Line thickness: {args.line_thickness}px (increased from 2px for better visibility)")
+    logger.info(f"Loss function: {args.loss_type} (focal_weight={args.focal_weight}, dice_weight={args.dice_weight})")
+    logger.info(f"Learning rate: {args.lr} (reduced from 1e-3 for fine-tuning)")
+    logger.info(f"Scheduler: ReduceLROnPlateau (adaptive learning rate based on validation IoU)")
+    logger.info("Class imbalance handling: Automatic pos_weight calculation and focal loss")
+    logger.info("================================")
+    
     # Create datasets from separate train and valid folders
     logger.info("Creating datasets...")
     train_data_root = str(Path(args.data_root) / "train")
@@ -449,18 +569,24 @@ def main():
     train_dataset = create_train_dataset(
         train_data_root,
         target_size=tuple(args.target_size),
+        line_thickness=args.line_thickness,
         cache_masks=False
     )
     
     val_dataset = create_val_dataset(
         val_data_root,
         target_size=tuple(args.target_size),
+        line_thickness=args.line_thickness,
         cache_masks=False
     )
     
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
-    # Create data loaders
+    # Create model
+    logger.info(f"Creating {args.model} model with {args.backbone} backbone...")
+    model = create_model(args.model, args.backbone, num_classes=1)
+    
+    # Create data loaders first (needed for pos_weight calculation)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -477,14 +603,23 @@ def main():
         pin_memory=True
     )
     
-    # Create model
-    logger.info(f"Creating {args.model} model with {args.backbone} backbone...")
-    model = create_model(args.model, args.backbone, num_classes=1)
+    # Calculate positive weight for class balancing
+    pos_weight = calculate_pos_weight(train_loader, device)
     
-    # Create loss function and optimizer
-    criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
+    # Create improved loss function and optimizer  
+    criterion = CombinedLoss(
+        loss_type=args.loss_type,
+        focal_weight=args.focal_weight,
+        dice_weight=args.dice_weight,
+        focal_alpha=1.0,
+        focal_gamma=args.focal_gamma,
+        pos_weight=pos_weight if args.loss_type == 'weighted_bce_dice' else None
+    )
+    
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+    )
     
     # Create trainer
     trainer = Trainer(

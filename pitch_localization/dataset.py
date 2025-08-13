@@ -220,7 +220,7 @@ def create_pitch_mask(
     pitch_lines: Dict[str, List[Tuple[float, float]]],
     img_width: int,
     img_height: int,
-    line_thickness: int = 2
+    line_thickness: int = 8
 ) -> np.ndarray:
     """
     Create binary mask from pitch line coordinates.
@@ -259,7 +259,7 @@ class PitchLocalizationDataset(Dataset):
         data_root: str,
         transform: Optional[Callable] = None,
         target_size: Tuple[int, int] = (512, 512),
-        line_thickness: int = 2,
+        line_thickness: int = 8,
         cache_masks: bool = False,
         subset: Optional[str] = None
     ):
