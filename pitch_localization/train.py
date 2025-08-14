@@ -106,11 +106,18 @@ def create_model(model_name: str = 'deeplabv3', backbone: str = 'resnet50', num_
         else:
             raise ValueError(f"Unsupported backbone {backbone} for DeepLabV3")
         
-        # Modify classifier for our task
-        model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+        # Modify classifier for our task with dropout for regularization
+        model.classifier = nn.Sequential(
+            model.classifier[0],  # Conv2d(2048, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            model.classifier[1],  # BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            model.classifier[2],  # ReLU(inplace=True)
+            nn.Dropout2d(p=0.3),  # Add dropout for regularization
+            model.classifier[3],  # Dropout(p=0.1, inplace=False)
+            nn.Conv2d(256, num_classes, kernel_size=1)  # Replace final conv layer
+        )
         # Initialize the new layer properly
-        nn.init.kaiming_normal_(model.classifier[4].weight, mode='fan_out', nonlinearity='relu')
-        nn.init.constant_(model.classifier[4].bias, 0)
+        nn.init.kaiming_normal_(model.classifier[5].weight, mode='fan_out', nonlinearity='relu')
+        nn.init.constant_(model.classifier[5].bias, 0)
         model.aux_classifier = None  # Remove auxiliary classifier
         
     elif model_name == 'unet':
@@ -152,14 +159,26 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Clamp predictions to avoid log(0)
-        pred = torch.clamp(pred, 1e-8, 1 - 1e-8)
+        # More aggressive clamping to prevent numerical issues
+        eps = 1e-7
+        pred = torch.clamp(pred, eps, 1 - eps)
+        target = torch.clamp(target, 0., 1.)
         
-        # Compute focal loss
-        ce_loss = -(target * torch.log(pred) + (1 - target) * torch.log(1 - pred))
+        # Compute binary cross entropy manually with better numerical stability
+        ce_loss = -(target * torch.log(pred + eps) + (1 - target) * torch.log(1 - pred + eps))
+        
+        # Compute focal weight with clamping
         p_t = torch.where(target == 1, pred, 1 - pred)
-        focal_weight = self.alpha * (1 - p_t) ** self.gamma
+        p_t = torch.clamp(p_t, eps, 1 - eps)  # Ensure p_t is in valid range
+        
+        # More stable focal weight computation
+        focal_weight = self.alpha * torch.pow(1 - p_t, self.gamma)
+        focal_weight = torch.clamp(focal_weight, 0, 1000)  # Prevent extremely large weights
+        
         focal_loss = focal_weight * ce_loss
+        
+        # Check for NaN/Inf and replace with zeros if found
+        focal_loss = torch.where(torch.isfinite(focal_loss), focal_loss, torch.zeros_like(focal_loss))
         
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -213,8 +232,18 @@ class CombinedLoss(nn.Module):
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # Ensure predictions are in valid range [0, 1]
-        pred = torch.clamp(pred, 1e-8, 1 - 1e-8)
+        eps = 1e-7
+        pred = torch.clamp(pred, eps, 1 - eps)
         target = torch.clamp(target, 0., 1.)
+        
+        # Check for NaN/Inf in inputs
+        if not torch.isfinite(pred).all():
+            logger.warning("NaN/Inf detected in predictions, replacing with zeros")
+            pred = torch.where(torch.isfinite(pred), pred, torch.zeros_like(pred))
+        
+        if not torch.isfinite(target).all():
+            logger.warning("NaN/Inf detected in targets, replacing with zeros")
+            target = torch.where(torch.isfinite(target), target, torch.zeros_like(target))
         
         dice = self.dice_loss(pred, target)
         
@@ -227,6 +256,11 @@ class CombinedLoss(nn.Module):
         else:  # fallback
             bce = self.bce_loss(pred, target)
             combined = 0.5 * bce + 0.5 * dice
+        
+        # Final check for NaN/Inf in combined loss
+        if not torch.isfinite(combined):
+            logger.warning(f"NaN/Inf detected in combined loss: {combined}")
+            combined = torch.tensor(0.0, device=combined.device, requires_grad=True)
         
         return combined
 
@@ -310,7 +344,9 @@ class Trainer:
         scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
         device: str = 'cuda',
         log_dir: str = 'runs',
-        checkpoint_dir: str = 'checkpoints'
+        checkpoint_dir: str = 'checkpoints',
+        warmup_epochs: int = 0,
+        base_lr: float = 1e-3
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -319,6 +355,8 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = base_lr
         
         # Setup logging and checkpointing
         self.log_dir = Path(log_dir)
@@ -369,17 +407,26 @@ class Trainer:
             
             loss = self.criterion(outputs, masks)
             
-            # Backward pass
+            # Backward pass with gradient clipping
             loss.backward()
+            
+            # Clip gradients to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
             self.optimizer.step()
             
-            # Update metrics
-            total_loss += loss.item()
+            # Update metrics (check for NaN in loss)
+            loss_item = loss.item()
+            if not np.isfinite(loss_item):
+                logger.warning(f"NaN/Inf loss detected in batch {batch_idx}, skipping metrics update")
+                loss_item = 0.0
+            
+            total_loss += loss_item
             self.train_metrics.update(outputs, masks)
             
             # Update progress bar
             pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
+                'loss': f"{loss_item:.4f}",
                 'avg_loss': f"{total_loss / (batch_idx + 1):.4f}"
             })
         
@@ -471,9 +518,15 @@ class Trainer:
             # Validate
             val_metrics = self.validate()
             
-            # Update learning rate
-            if self.scheduler:
-                # ReduceLROnPlateau needs validation metric
+            # Apply warmup or regular learning rate scheduling
+            if epoch < self.warmup_epochs:
+                # Linear warmup
+                warmup_factor = (epoch + 1) / self.warmup_epochs
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = self.base_lr * warmup_factor
+                logger.info(f"Warmup epoch {epoch + 1}/{self.warmup_epochs}, LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+            elif self.scheduler:
+                # Regular scheduling after warmup
                 if hasattr(self.scheduler, 'step') and 'ReduceLROnPlateau' in str(type(self.scheduler)):
                     self.scheduler.step(val_metrics['iou'])  # Use IoU for plateau detection
                 else:
@@ -512,8 +565,8 @@ def main():
                        help='Model backbone')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--lr', type=float, default=2e-3, help='Learning rate (increased for aggressive training)')
+    parser.add_argument('--weight-decay', type=float, default=5e-4, help='Weight decay (increased for regularization)')
     parser.add_argument('--target-size', type=int, nargs=2, default=[512, 512], help='Target image size')
     parser.add_argument('--num-workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], help='Device to use')
@@ -528,10 +581,14 @@ def main():
                        help='Weight for focal/BCE loss component')
     parser.add_argument('--dice-weight', type=float, default=0.8, 
                        help='Weight for dice loss component')
-    parser.add_argument('--focal-gamma', type=float, default=2.0, 
-                       help='Gamma parameter for focal loss')
-    parser.add_argument('--line-thickness', type=int, default=8, 
+    parser.add_argument('--focal-gamma', type=float, default=2.5, 
+                       help='Gamma parameter for focal loss (increased for stronger focusing)')
+    parser.add_argument('--line-thickness', type=int, default=4, 
                        help='Line thickness for pitch mask generation')
+    parser.add_argument('--use-cosine-scheduler', action='store_true',
+                       help='Use cosine annealing scheduler instead of ReduceLROnPlateau')
+    parser.add_argument('--warmup-epochs', type=int, default=3,
+                       help='Number of warmup epochs for learning rate')
     
     args = parser.parse_args()
     
@@ -617,9 +674,15 @@ def main():
     )
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
-    )
+    # More aggressive scheduler for faster convergence
+    if args.use_cosine_scheduler:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.8, patience=5, min_lr=1e-6
+        )
     
     # Create trainer
     trainer = Trainer(
@@ -631,7 +694,9 @@ def main():
         scheduler=scheduler,
         device=device,
         log_dir=args.log_dir,
-        checkpoint_dir=args.checkpoint_dir
+        checkpoint_dir=args.checkpoint_dir,
+        warmup_epochs=args.warmup_epochs,
+        base_lr=args.lr
     )
     
     # Start training
