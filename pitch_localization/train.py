@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 import torchvision.models.segmentation as seg_models
 import numpy as np
 from tqdm import tqdm
@@ -346,7 +347,8 @@ class Trainer:
         log_dir: str = 'runs',
         checkpoint_dir: str = 'checkpoints',
         warmup_epochs: int = 0,
-        base_lr: float = 1e-3
+        base_lr: float = 1e-3,
+        use_amp: bool = True
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -357,6 +359,10 @@ class Trainer:
         self.device = device
         self.warmup_epochs = warmup_epochs
         self.base_lr = base_lr
+        self.use_amp = use_amp and device == 'cuda'  # Only use AMP on CUDA
+        
+        # Initialize AMP scaler if using AMP
+        self.scaler = GradScaler() if self.use_amp else None
         
         # Setup logging and checkpointing
         self.log_dir = Path(log_dir)
@@ -376,6 +382,7 @@ class Trainer:
         
         logger.info(f"Trainer initialized. Experiment: {self.experiment_name}")
         logger.info(f"Device: {device}")
+        logger.info(f"AMP enabled: {self.use_amp}")
         logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     def train_epoch(self) -> Dict[str, float]:
@@ -392,28 +399,54 @@ class Trainer:
             images = batch['image'].to(self.device)
             masks = batch['mask'].to(self.device)
             
-            # Forward pass
+            # Forward pass with AMP
             self.optimizer.zero_grad()
-            outputs = self.model(images)
             
-            # Handle different model outputs
-            if isinstance(outputs, dict):  # DeepLabV3 returns dict
-                outputs = outputs['out']
-            
-            # Apply sigmoid to get probabilities for DeepLabV3
-            # UNet already has sigmoid in forward pass
-            if hasattr(self.model, 'classifier'):  # DeepLabV3 model
-                outputs = torch.sigmoid(outputs)
-            
-            loss = self.criterion(outputs, masks)
-            
-            # Backward pass with gradient clipping
-            loss.backward()
-            
-            # Clip gradients to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            self.optimizer.step()
+            if self.use_amp:
+                with autocast():
+                    outputs = self.model(images)
+                    
+                    # Handle different model outputs
+                    if isinstance(outputs, dict):  # DeepLabV3 returns dict
+                        outputs = outputs['out']
+                    
+                    # Apply sigmoid to get probabilities for DeepLabV3
+                    # UNet already has sigmoid in forward pass
+                    if hasattr(self.model, 'classifier'):  # DeepLabV3 model
+                        outputs = torch.sigmoid(outputs)
+                    
+                    loss = self.criterion(outputs, masks)
+                
+                # Backward pass with AMP
+                self.scaler.scale(loss).backward()
+                
+                # Clip gradients and update with scaler
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                outputs = self.model(images)
+                
+                # Handle different model outputs
+                if isinstance(outputs, dict):  # DeepLabV3 returns dict
+                    outputs = outputs['out']
+                
+                # Apply sigmoid to get probabilities for DeepLabV3
+                # UNet already has sigmoid in forward pass
+                if hasattr(self.model, 'classifier'):  # DeepLabV3 model
+                    outputs = torch.sigmoid(outputs)
+                
+                loss = self.criterion(outputs, masks)
+                
+                # Backward pass with gradient clipping
+                loss.backward()
+                
+                # Clip gradients to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                self.optimizer.step()
             
             # Update metrics (check for NaN in loss)
             loss_item = loss.item()
@@ -454,19 +487,34 @@ class Trainer:
                 images = batch['image'].to(self.device)
                 masks = batch['mask'].to(self.device)
                 
-                # Forward pass
-                outputs = self.model(images)
-                
-                # Handle different model outputs
-                if isinstance(outputs, dict):  # DeepLabV3 returns dict
-                    outputs = outputs['out']
-                
-                # Apply sigmoid to get probabilities for DeepLabV3
-                # UNet already has sigmoid in forward pass
-                if hasattr(self.model, 'classifier'):  # DeepLabV3 model
-                    outputs = torch.sigmoid(outputs)
-                
-                loss = self.criterion(outputs, masks)
+                # Forward pass with AMP
+                if self.use_amp:
+                    with autocast():
+                        outputs = self.model(images)
+                        
+                        # Handle different model outputs
+                        if isinstance(outputs, dict):  # DeepLabV3 returns dict
+                            outputs = outputs['out']
+                        
+                        # Apply sigmoid to get probabilities for DeepLabV3
+                        # UNet already has sigmoid in forward pass
+                        if hasattr(self.model, 'classifier'):  # DeepLabV3 model
+                            outputs = torch.sigmoid(outputs)
+                        
+                        loss = self.criterion(outputs, masks)
+                else:
+                    outputs = self.model(images)
+                    
+                    # Handle different model outputs
+                    if isinstance(outputs, dict):  # DeepLabV3 returns dict
+                        outputs = outputs['out']
+                    
+                    # Apply sigmoid to get probabilities for DeepLabV3
+                    # UNet already has sigmoid in forward pass
+                    if hasattr(self.model, 'classifier'):  # DeepLabV3 model
+                        outputs = torch.sigmoid(outputs)
+                    
+                    loss = self.criterion(outputs, masks)
                 
                 # Update metrics
                 total_loss += loss.item()
@@ -494,6 +542,9 @@ class Trainer:
         
         if self.scheduler:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+            
+        if self.scaler:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
         # Save regular checkpoint
         checkpoint_path = self.checkpoint_dir / f"{self.experiment_name}_epoch_{self.epoch}.pth"
@@ -589,6 +640,10 @@ def main():
                        help='Use cosine annealing scheduler instead of ReduceLROnPlateau')
     parser.add_argument('--warmup-epochs', type=int, default=3,
                        help='Number of warmup epochs for learning rate')
+    parser.add_argument('--use-amp', action='store_true', default=True,
+                       help='Use Automatic Mixed Precision for faster training')
+    parser.add_argument('--no-amp', action='store_true',
+                       help='Disable Automatic Mixed Precision')
     
     args = parser.parse_args()
     
@@ -609,8 +664,12 @@ def main():
     
     logger.info(f"Using device: {device}")
     
+    # Determine AMP usage
+    use_amp = args.use_amp and not args.no_amp and device == 'cuda'
+    
     # Log training improvements
     logger.info("=== TRAINING IMPROVEMENTS ===")
+    logger.info(f"AMP enabled: {use_amp} (speeds up training on modern GPUs)")
     logger.info(f"Line thickness: {args.line_thickness}px (increased from 2px for better visibility)")
     logger.info(f"Loss function: {args.loss_type} (focal_weight={args.focal_weight}, dice_weight={args.dice_weight})")
     logger.info(f"Learning rate: {args.lr} (reduced from 1e-3 for fine-tuning)")
@@ -696,7 +755,8 @@ def main():
         log_dir=args.log_dir,
         checkpoint_dir=args.checkpoint_dir,
         warmup_epochs=args.warmup_epochs,
-        base_lr=args.lr
+        base_lr=args.lr,
+        use_amp=use_amp
     )
     
     # Start training
