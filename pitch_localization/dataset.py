@@ -722,14 +722,13 @@ class PitchAugmentation:
 
 
 def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
-    """Create training dataset with aggressive augmentations for better generalization."""
+    """Create training dataset with augmentations."""
     augmentation = PitchAugmentation(
         target_size=kwargs.get('target_size', (512, 512)),
-        rotation_range=kwargs.get('rotation_range', 20.0),  # More aggressive rotation
-        brightness_range=kwargs.get('brightness_range', 0.3),  # Stronger brightness variation
-        contrast_range=kwargs.get('contrast_range', 0.3),  # Stronger contrast variation
-        saturation_range=kwargs.get('saturation_range', 0.25),  # More saturation change
-        hue_range=kwargs.get('hue_range', 0.15),  # Add hue variation
+        rotation_range=kwargs.get('rotation_range', 10.0),
+        brightness_range=kwargs.get('brightness_range', 0.15),
+        contrast_range=kwargs.get('contrast_range', 0.15),
+        saturation_range=kwargs.get('saturation_range', 0.15),
         horizontal_flip_prob=kwargs.get('horizontal_flip_prob', 0.5)
     )
     

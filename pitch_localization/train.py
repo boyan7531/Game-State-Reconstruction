@@ -107,18 +107,11 @@ def create_model(model_name: str = 'deeplabv3', backbone: str = 'resnet50', num_
         else:
             raise ValueError(f"Unsupported backbone {backbone} for DeepLabV3")
         
-        # Modify classifier for our task with dropout for regularization
-        model.classifier = nn.Sequential(
-            model.classifier[0],  # Conv2d(2048, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
-            model.classifier[1],  # BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-            model.classifier[2],  # ReLU(inplace=True)
-            nn.Dropout2d(p=0.3),  # Add dropout for regularization
-            model.classifier[3],  # Dropout(p=0.1, inplace=False)
-            nn.Conv2d(256, num_classes, kernel_size=1)  # Replace final conv layer
-        )
+        # Modify classifier for our task
+        model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
         # Initialize the new layer properly
-        nn.init.kaiming_normal_(model.classifier[5].weight, mode='fan_out', nonlinearity='relu')
-        nn.init.constant_(model.classifier[5].bias, 0)
+        nn.init.kaiming_normal_(model.classifier[4].weight, mode='fan_out', nonlinearity='relu')
+        nn.init.constant_(model.classifier[4].bias, 0)
         model.aux_classifier = None  # Remove auxiliary classifier
         
     elif model_name == 'unet':
@@ -616,8 +609,8 @@ def main():
                        help='Model backbone')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=2e-3, help='Learning rate (increased for aggressive training)')
-    parser.add_argument('--weight-decay', type=float, default=5e-4, help='Weight decay (increased for regularization)')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--target-size', type=int, nargs=2, default=[512, 512], help='Target image size')
     parser.add_argument('--num-workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], help='Device to use')
@@ -632,9 +625,9 @@ def main():
                        help='Weight for focal/BCE loss component')
     parser.add_argument('--dice-weight', type=float, default=0.8, 
                        help='Weight for dice loss component')
-    parser.add_argument('--focal-gamma', type=float, default=2.5, 
-                       help='Gamma parameter for focal loss (increased for stronger focusing)')
-    parser.add_argument('--line-thickness', type=int, default=4, 
+    parser.add_argument('--focal-gamma', type=float, default=1.0, 
+                       help='Gamma parameter for focal loss')
+    parser.add_argument('--line-thickness', type=int, default=8, 
                        help='Line thickness for pitch mask generation')
     parser.add_argument('--use-cosine-scheduler', action='store_true',
                        help='Use cosine annealing scheduler instead of ReduceLROnPlateau')
