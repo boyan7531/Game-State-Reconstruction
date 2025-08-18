@@ -722,22 +722,25 @@ class PitchAugmentation:
 
 
 def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
-    """Create training dataset with augmentations."""
-    augmentation = PitchAugmentation(
-        target_size=kwargs.get('target_size', (512, 512)),
-        rotation_range=kwargs.get('rotation_range', 10.0),
-        brightness_range=kwargs.get('brightness_range', 0.15),
-        contrast_range=kwargs.get('contrast_range', 0.15),
-        saturation_range=kwargs.get('saturation_range', 0.15),
-        horizontal_flip_prob=kwargs.get('horizontal_flip_prob', 0.5)
-    )
+    """Create training dataset with optional augmentations."""
+    augment = kwargs.get('augment', True)
+    transform = None
+    if augment:
+        transform = PitchAugmentation(
+            target_size=kwargs.get('target_size', (512, 512)),
+            rotation_range=kwargs.get('rotation_range', 10.0),
+            brightness_range=kwargs.get('brightness_range', 0.15),
+            contrast_range=kwargs.get('contrast_range', 0.15),
+            saturation_range=kwargs.get('saturation_range', 0.15),
+            horizontal_flip_prob=kwargs.get('horizontal_flip_prob', 0.5)
+        )
     
     return PitchLocalizationDataset(
         data_root=data_root,
-        transform=augmentation,
+        transform=transform,
         **{k: v for k, v in kwargs.items() if k not in [
             'rotation_range', 'brightness_range', 'contrast_range', 
-            'saturation_range', 'horizontal_flip_prob'
+            'saturation_range', 'horizontal_flip_prob', 'augment'
         ]}
     )
 

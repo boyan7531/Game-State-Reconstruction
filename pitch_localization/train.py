@@ -109,9 +109,10 @@ def create_model(model_name: str = 'deeplabv3', backbone: str = 'resnet50', num_
         
         # Modify classifier for our task
         model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-        # Initialize the new layer properly
+        # Initialize the new layer properly for thin line detection
+        # Use smaller initialization for better thin line sensitivity
         nn.init.kaiming_normal_(model.classifier[4].weight, mode='fan_out', nonlinearity='relu')
-        nn.init.constant_(model.classifier[4].bias, 0)
+        nn.init.constant_(model.classifier[4].bias, -2.0)  # Slight negative bias for better thin line detection
         model.aux_classifier = None  # Remove auxiliary classifier
         
     elif model_name == 'unet':
@@ -415,7 +416,10 @@ class Trainer:
                 
                 # Clip gradients and update with scaler
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # More conservative gradient clipping for stability
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                if grad_norm > 10.0:  # Log if gradients are exploding
+                    logger.warning(f"Large gradient norm detected: {grad_norm:.2f}")
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -437,7 +441,9 @@ class Trainer:
                 loss.backward()
                 
                 # Clip gradients to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                if grad_norm > 10.0:  # Log if gradients are exploding
+                    logger.warning(f"Large gradient norm detected: {grad_norm:.2f}")
                 
                 self.optimizer.step()
             
@@ -446,6 +452,10 @@ class Trainer:
             if not np.isfinite(loss_item):
                 logger.warning(f"NaN/Inf loss detected in batch {batch_idx}, skipping metrics update")
                 loss_item = 0.0
+            elif loss_item > 10.0:  # Unusually high loss
+                logger.warning(f"High loss detected: {loss_item:.4f} in batch {batch_idx}")
+            elif loss_item < 1e-6:  # Unusually low loss (might indicate vanishing gradients)
+                logger.warning(f"Very low loss detected: {loss_item:.6f} in batch {batch_idx}")
             
             total_loss += loss_item
             self.train_metrics.update(outputs, masks)
@@ -626,7 +636,9 @@ def main():
     parser.add_argument('--dice-weight', type=float, default=0.8, 
                        help='Weight for dice loss component')
     parser.add_argument('--focal-gamma', type=float, default=1.0, 
-                       help='Gamma parameter for focal loss')
+                       help='Gamma parameter for focal loss (higher values focus more on hard examples)')
+    parser.add_argument('--focal-gamma-thin-lines', type=float, default=None,
+                       help='Optional higher gamma for thin line detection (goal posts, crossbars)')
     parser.add_argument('--line-thickness', type=int, default=8, 
                        help='Line thickness for pitch mask generation')
     parser.add_argument('--use-cosine-scheduler', action='store_true',
@@ -637,8 +649,27 @@ def main():
                        help='Use Automatic Mixed Precision for faster training')
     parser.add_argument('--no-amp', action='store_true',
                        help='Disable Automatic Mixed Precision')
+    parser.add_argument('--enable-multiscale-augmentation', action='store_true',
+                       help='Enable multi-scale augmentation for better thin line detection')
+    parser.add_argument('--scale-range', type=float, nargs=2, default=[0.8, 1.2],
+                       help='Scale range for multi-scale augmentation (min, max)')
+    parser.add_argument('--no-augment', action='store_true',
+                       help='Disable data augmentation for training')
     
     args = parser.parse_args()
+    
+    # Validate training parameters (prevent crashes)
+    if args.line_thickness < 1 or args.line_thickness > 20:
+        logger.warning(f"Line thickness {args.line_thickness} is unusual. Recommended: 1-8 for thin lines, 4-8 for thick lines")
+    
+    if args.focal_gamma < 0.5 or args.focal_gamma > 5.0:
+        logger.warning(f"Focal gamma {args.focal_gamma} is unusual. Recommended: 0.5-3.0")
+    
+    if args.enable_multiscale_augmentation:
+        if args.scale_range[0] >= args.scale_range[1]:
+            raise ValueError("Scale range min must be less than max")
+        if args.scale_range[0] < 0.5 or args.scale_range[1] > 2.0:
+            logger.warning("Extreme scale range may hurt performance")
     
     # Set device with MPS support
     if args.device == 'auto':
@@ -661,12 +692,18 @@ def main():
     use_amp = args.use_amp and not args.no_amp and device == 'cuda'
     
     # Log training improvements
-    logger.info("=== TRAINING IMPROVEMENTS ===")
+    logger.info("=== TRAINING CONFIGURATION ===")
     logger.info(f"AMP enabled: {use_amp} (speeds up training on modern GPUs)")
-    logger.info(f"Line thickness: {args.line_thickness}px (increased from 2px for better visibility)")
+    logger.info(f"Line thickness: {args.line_thickness}px")
     logger.info(f"Loss function: {args.loss_type} (focal_weight={args.focal_weight}, dice_weight={args.dice_weight})")
-    logger.info(f"Learning rate: {args.lr} (reduced from 1e-3 for fine-tuning)")
-    logger.info(f"Scheduler: ReduceLROnPlateau (adaptive learning rate based on validation IoU)")
+    logger.info(f"Focal gamma: {args.focal_gamma} (higher = focus on hard examples)")
+    if args.focal_gamma_thin_lines:
+        logger.info(f"Thin line focal gamma: {args.focal_gamma_thin_lines} (for goal posts/crossbars)")
+    logger.info(f"Learning rate: {args.lr}")
+    logger.info(f"Scheduler: {'CosineAnnealing' if args.use_cosine_scheduler else 'ReduceLROnPlateau'}")
+    logger.info(f"Multi-scale augmentation: {args.enable_multiscale_augmentation}")
+    if args.enable_multiscale_augmentation:
+        logger.info(f"Scale range: {args.scale_range[0]:.1f} - {args.scale_range[1]:.1f}")
     logger.info("Class imbalance handling: Automatic pos_weight calculation and focal loss")
     logger.info("================================")
     
@@ -675,12 +712,21 @@ def main():
     train_data_root = str(Path(args.data_root) / "train")
     val_data_root = str(Path(args.data_root) / "valid")
     
-    train_dataset = create_train_dataset(
-        train_data_root,
-        target_size=tuple(args.target_size),
-        line_thickness=args.line_thickness,
-        cache_masks=False
-    )
+    # Create training dataset with enhanced augmentation options
+    train_kwargs = {
+        'target_size': tuple(args.target_size),
+        'line_thickness': args.line_thickness,
+        'cache_masks': False,
+        'augment': not args.no_augment
+    }
+    
+    # Add multi-scale augmentation if enabled
+    if args.enable_multiscale_augmentation:
+        train_kwargs['scale_range'] = args.scale_range
+        train_kwargs['enable_multiscale'] = True
+        logger.info("Enhanced multi-scale augmentation enabled for better thin line detection")
+    
+    train_dataset = create_train_dataset(train_data_root, **train_kwargs)
     
     val_dataset = create_val_dataset(
         val_data_root,

@@ -30,3 +30,8 @@ results/
 debug_iou.py
 pitch_segmentation_20250813_142429_best.pth
 pitch_segmentation_20250813_205942_best.pth
+*.pth
+*.mp4
+augmented_visualization/
+clean_visualization/
+visualization_output/
