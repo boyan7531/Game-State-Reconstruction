@@ -819,7 +819,6 @@ def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
     return PitchLocalizationDataset(
         data_root=data_root,
         transform=transform,
-        multiclass=multiclass,
         **{k: v for k, v in kwargs.items() if k not in [
             'rotation_range', 'brightness_range', 'contrast_range', 
             'saturation_range', 'horizontal_flip_prob', 'augment'
@@ -829,12 +828,9 @@ def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
 
 def create_val_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
     """Create validation dataset without augmentations."""
-    multiclass = kwargs.get('multiclass', True)
-    
     return PitchLocalizationDataset(
         data_root=data_root,
         transform=None,  # No augmentations for validation
-        multiclass=multiclass,
         **kwargs
     )
 
