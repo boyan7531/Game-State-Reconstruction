@@ -313,16 +313,17 @@ class CombinedLoss(nn.Module):
 
 
 class MultiClassMetrics:
-    def __init__(self, num_classes: int = NUM_CLASSES):
+    def __init__(self, num_classes: int = NUM_CLASSES, device: str = 'cuda'):
         self.num_classes = num_classes
+        self.device = device
         self.reset()
     
     def reset(self):
         self.total_samples = 0
         self.correct_samples = 0
-        self.class_correct = torch.zeros(self.num_classes)
-        self.class_total = torch.zeros(self.num_classes)
-        self.confusion_matrix = torch.zeros(self.num_classes, self.num_classes)
+        self.class_correct = torch.zeros(self.num_classes, device=self.device)
+        self.class_total = torch.zeros(self.num_classes, device=self.device)
+        self.confusion_matrix = torch.zeros(self.num_classes, self.num_classes, device=self.device)
     
     def update(self, pred: torch.Tensor, target: torch.Tensor):
         # pred shape: (N, C, H, W), target shape: (N, H, W)
@@ -340,7 +341,7 @@ class MultiClassMetrics:
             # Use bincount to efficiently compute confusion matrix updates
             indices = valid_target * self.num_classes + valid_pred
             bincount = torch.bincount(indices, minlength=self.num_classes * self.num_classes)
-            confusion_update = bincount.reshape(self.num_classes, self.num_classes).float()
+            confusion_update = bincount.reshape(self.num_classes, self.num_classes).float().to(self.device)
             self.confusion_matrix += confusion_update
         
         # Update accuracy counters
@@ -353,8 +354,8 @@ class MultiClassMetrics:
         # Per-class accuracy (fully vectorized)
         correct_per_class = torch.bincount((target_flat * (pred_flat == target_flat)).long(), minlength=self.num_classes)
         total_per_class = torch.bincount(target_flat.long(), minlength=self.num_classes)
-        self.class_correct += correct_per_class.float()
-        self.class_total += total_per_class.float()
+        self.class_correct += correct_per_class.float().to(self.device)
+        self.class_total += total_per_class.float().to(self.device)
     
     def compute(self) -> Dict[str, float]:
         eps = 1e-8
@@ -389,13 +390,14 @@ class MultiClassMetrics:
 
 
 class SegmentationMetrics:
-    def __init__(self, threshold: float = 0.5, task_type: str = 'binary', num_classes: int = NUM_CLASSES):
+    def __init__(self, threshold: float = 0.5, task_type: str = 'binary', num_classes: int = NUM_CLASSES, device: str = 'cuda'):
         self.threshold = threshold
         self.task_type = task_type
         self.num_classes = num_classes
+        self.device = device
         
         if task_type == 'multiclass':
-            self.metrics = MultiClassMetrics(num_classes)
+            self.metrics = MultiClassMetrics(num_classes, device)
         else:
             self.reset()
     
@@ -518,8 +520,8 @@ class Trainer:
         # Training state
         self.epoch = 0
         self.best_val_iou = 0.0
-        self.train_metrics = SegmentationMetrics(task_type=task_type, num_classes=num_classes)
-        self.val_metrics = SegmentationMetrics(task_type=task_type, num_classes=num_classes)
+        self.train_metrics = SegmentationMetrics(task_type=task_type, num_classes=num_classes, device=device)
+        self.val_metrics = SegmentationMetrics(task_type=task_type, num_classes=num_classes, device=device)
         
         logger.info(f"Trainer initialized. Experiment: {self.experiment_name}")
         logger.info(f"Device: {device}")
