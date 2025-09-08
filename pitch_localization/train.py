@@ -332,12 +332,16 @@ class MultiClassMetrics:
         pred_flat = pred_classes.view(-1)
         target_flat = target.view(-1)
         
-        # Update confusion matrix
-        for i in range(pred_flat.size(0)):
-            pred_class = pred_flat[i].item()
-            true_class = target_flat[i].item()
-            if 0 <= pred_class < self.num_classes and 0 <= true_class < self.num_classes:
-                self.confusion_matrix[true_class, pred_class] += 1
+        # Update confusion matrix efficiently using bincount
+        valid_mask = (target_flat >= 0) & (target_flat < self.num_classes) & (pred_flat >= 0) & (pred_flat < self.num_classes)
+        if valid_mask.sum() > 0:
+            valid_pred = pred_flat[valid_mask]
+            valid_target = target_flat[valid_mask]
+            # Use bincount to efficiently compute confusion matrix updates
+            indices = valid_target * self.num_classes + valid_pred
+            bincount = torch.bincount(indices, minlength=self.num_classes * self.num_classes)
+            confusion_update = bincount.reshape(self.num_classes, self.num_classes).float()
+            self.confusion_matrix += confusion_update
         
         # Update accuracy counters
         correct = (pred_flat == target_flat).sum().item()
@@ -346,13 +350,11 @@ class MultiClassMetrics:
         self.correct_samples += correct
         self.total_samples += total
         
-        # Per-class accuracy
-        for c in range(self.num_classes):
-            class_mask = (target_flat == c)
-            if class_mask.sum() > 0:
-                class_correct = ((pred_flat == target_flat) & class_mask).sum().item()
-                self.class_correct[c] += class_correct
-                self.class_total[c] += class_mask.sum().item()
+        # Per-class accuracy (fully vectorized)
+        correct_per_class = torch.bincount((target_flat * (pred_flat == target_flat)).long(), minlength=self.num_classes)
+        total_per_class = torch.bincount(target_flat.long(), minlength=self.num_classes)
+        self.class_correct += correct_per_class.float()
+        self.class_total += total_per_class.float()
     
     def compute(self) -> Dict[str, float]:
         eps = 1e-8
