@@ -13,6 +13,44 @@ import torchvision.transforms as transforms
 logger = logging.getLogger(__name__)
 
 
+# Line type to class ID mapping (exact names from annotations)
+LINE_CLASS_MAPPING = {
+    'background': 0,  # No line/background
+    'Side line top': 1,
+    'Circle central': 2,
+    'Big rect. right main': 3,
+    'Big rect. right top': 4,
+    'Big rect. left main': 5,
+    'Big rect. left top': 6,
+    'Circle right': 7,
+    'Middle line': 8,
+    'Side line right': 9,
+    'Circle left': 10,
+    'Side line bottom': 11,
+    'Side line left': 12,
+    'Small rect. right main': 13,
+    'Small rect. right top': 14,
+    'Small rect. left main': 15,
+    'Small rect. left top': 16,
+    'Goal right post left': 17,
+    'Goal right crossbar': 18,
+    'Goal left post right': 19,
+    'Goal left crossbar': 20,
+    'Goal right post right': 21,
+    'Small rect. right bottom': 22,
+    'Big rect. right bottom': 23,
+    'Goal left post left': 24,
+    'Small rect. left bottom': 25,
+    'Big rect. left bottom': 26,
+}
+
+# Reverse mapping for visualization/debugging
+CLASS_TO_LINE_MAPPING = {v: k for k, v in LINE_CLASS_MAPPING.items()}
+
+# Total number of classes
+NUM_CLASSES = len(LINE_CLASS_MAPPING)
+
+
 def discover_frame_annotation_pairs(
     data_root: str,
     output_csv: Optional[str] = None
@@ -220,20 +258,22 @@ def create_pitch_mask(
     pitch_lines: Dict[str, List[Tuple[float, float]]],
     img_width: int,
     img_height: int,
-    line_thickness: int = 8
+    line_thickness: int = 8,
+    multiclass: bool = True
 ) -> np.ndarray:
     """
-    Create binary mask from pitch line coordinates.
+    Create multi-class or binary mask from pitch line coordinates.
     
     Args:
         pitch_lines: Dictionary mapping line names to lists of (x_px, y_px) coordinates
         img_width: Width of the output mask in pixels
         img_height: Height of the output mask in pixels
         line_thickness: Thickness of the drawn lines in pixels
+        multiclass: If True, create multi-class mask; if False, create binary mask
         
     Returns:
-        Binary mask as numpy array (height, width) with dtype uint8
-        Lines are white (255), background is black (0)
+        Multi-class mask as numpy array (height, width) with dtype uint8
+        Background is 0, each line type has its own class ID
     """
     mask = np.zeros((img_height, img_width), dtype=np.uint8)
     
@@ -243,12 +283,27 @@ def create_pitch_mask(
             
         coords_array = np.array(coords, dtype=np.int32)
         
-        if line_name in ['center_circle', 'left_penalty_arc', 'right_penalty_arc']:
-            cv2.polylines(mask, [coords_array], isClosed=True, color=255, thickness=line_thickness)
-        elif line_name in ['penalty_area_left', 'penalty_area_right', 'goal_area_left', 'goal_area_right']:
-            cv2.polylines(mask, [coords_array], isClosed=True, color=255, thickness=line_thickness)
+        # Get class ID for this line type
+        if multiclass:
+            class_id = LINE_CLASS_MAPPING.get(line_name, 0)  # Default to background if unknown
+            if class_id == 0:
+                logger.warning(f"Unknown line type: '{line_name}', treating as background")
+                continue
         else:
-            cv2.polylines(mask, [coords_array], isClosed=False, color=255, thickness=line_thickness)
+            class_id = 255  # Binary mask: all lines are white
+        
+        # Determine if line should be closed based on line type
+        is_closed = line_name in [
+            'Circle central', 'Circle left', 'Circle right',
+            'Big rect. left main', 'Big rect. right main',
+            'Small rect. left main', 'Small rect. right main',
+            'Big rect. left top', 'Big rect. right top',
+            'Small rect. left top', 'Small rect. right top',
+            'Big rect. left bottom', 'Big rect. right bottom',
+            'Small rect. left bottom', 'Small rect. right bottom'
+        ]
+        
+        cv2.polylines(mask, [coords_array], isClosed=is_closed, color=class_id, thickness=line_thickness)
     
     return mask
 
@@ -261,7 +316,9 @@ class PitchLocalizationDataset(Dataset):
         target_size: Tuple[int, int] = (512, 512),
         line_thickness: int = 8,
         cache_masks: bool = False,
-        subset: Optional[str] = None
+        subset: Optional[str] = None,
+        multiclass: bool = True,
+        num_classes: int = NUM_CLASSES
     ):
         """
         PyTorch Dataset for pitch localization training.
@@ -273,6 +330,8 @@ class PitchLocalizationDataset(Dataset):
             line_thickness: Thickness for drawing pitch lines in masks
             cache_masks: Whether to cache generated masks for faster training
             subset: Optional subset name for debugging (e.g., 'train', 'val')
+            multiclass: Whether to use multi-class or binary segmentation
+            num_classes: Number of classes for multi-class segmentation
         """
         self.data_root = Path(data_root)
         self.transform = transform
@@ -280,6 +339,8 @@ class PitchLocalizationDataset(Dataset):
         self.line_thickness = line_thickness
         self.cache_masks = cache_masks
         self.subset = subset
+        self.multiclass = multiclass
+        self.num_classes = num_classes
         
         # Load sequences and annotations (efficient approach)
         logger.info(f"Loading sequences from {data_root}")
@@ -400,9 +461,14 @@ class PitchLocalizationDataset(Dataset):
                 image = self._default_transform(image)
                 mask = self._resize_mask(mask, self.target_size)
             
-            # Convert mask to tensor and normalize to [0, 1] range
-            mask = mask.astype(np.float32) / 255.0  # Normalize from [0, 255] to [0, 1]
-            mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (1, H, W)
+            # Convert mask to tensor
+            if self.multiclass:
+                # For multi-class segmentation, keep integer class labels
+                mask_tensor = torch.from_numpy(mask.astype(np.int64))  # (H, W) with class indices
+            else:
+                # For binary segmentation, normalize to [0, 1] range
+                mask = mask.astype(np.float32) / 255.0  # Normalize from [0, 255] to [0, 1]
+                mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (1, H, W)
             
             # Prepare metadata
             metadata = {
@@ -444,7 +510,7 @@ class PitchLocalizationDataset(Dataset):
         
         # Create mask
         mask = create_pitch_mask(
-            pitch_lines, image_size[0], image_size[1], self.line_thickness
+            pitch_lines, image_size[0], image_size[1], self.line_thickness, self.multiclass
         )
         
         # Cache if enabled
@@ -551,7 +617,12 @@ class PitchLocalizationDataset(Dataset):
     def _get_dummy_sample(self) -> Dict[str, Any]:
         """Return a dummy sample in case of errors."""
         dummy_image = torch.zeros(3, self.target_size[1], self.target_size[0])
-        dummy_mask = torch.zeros(1, self.target_size[1], self.target_size[0])
+        
+        if self.multiclass:
+            dummy_mask = torch.zeros(self.target_size[1], self.target_size[0], dtype=torch.int64)
+        else:
+            dummy_mask = torch.zeros(1, self.target_size[1], self.target_size[0])
+            
         dummy_metadata = {
             'frame_path': 'dummy',
             'frame_name': 'dummy.jpg',
@@ -580,8 +651,16 @@ class PitchLocalizationDataset(Dataset):
             image_pil.save(save_path / f"debug_image_{idx}.jpg")
             
             # Save mask
-            mask_np = (sample['mask'].squeeze().numpy() * 255).astype(np.uint8)
-            cv2.imwrite(str(save_path / f"debug_mask_{idx}.png"), mask_np)
+            if self.multiclass:
+                # For multi-class, convert class indices to colors for visualization
+                mask_np = sample['mask'].numpy().astype(np.uint8)
+                # Scale class indices to visible range (0-255)
+                mask_vis = (mask_np * (255 // self.num_classes)).astype(np.uint8)
+                cv2.imwrite(str(save_path / f"debug_mask_{idx}.png"), mask_vis)
+            else:
+                # For binary, convert back to 0-255 range
+                mask_np = (sample['mask'].squeeze().numpy() * 255).astype(np.uint8)
+                cv2.imwrite(str(save_path / f"debug_mask_{idx}.png"), mask_np)
             
             logger.info(f"Saved debug visualizations to {save_path}")
         
@@ -724,6 +803,8 @@ class PitchAugmentation:
 def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
     """Create training dataset with optional augmentations."""
     augment = kwargs.get('augment', True)
+    multiclass = kwargs.get('multiclass', True)
+    
     transform = None
     if augment:
         transform = PitchAugmentation(
@@ -738,6 +819,7 @@ def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
     return PitchLocalizationDataset(
         data_root=data_root,
         transform=transform,
+        multiclass=multiclass,
         **{k: v for k, v in kwargs.items() if k not in [
             'rotation_range', 'brightness_range', 'contrast_range', 
             'saturation_range', 'horizontal_flip_prob', 'augment'
@@ -747,9 +829,12 @@ def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
 
 def create_val_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
     """Create validation dataset without augmentations."""
+    multiclass = kwargs.get('multiclass', True)
+    
     return PitchLocalizationDataset(
         data_root=data_root,
         transform=None,  # No augmentations for validation
+        multiclass=multiclass,
         **kwargs
     )
 
@@ -759,7 +844,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     # Adjust path as needed
-    data_root = "SoccerNet/SN-GSR-2025/train"
+    data_root = "/Users/boyan531/Documents/football/SoccerNet/SN-GSR-2025/train"
     
     print("=== Testing Dataset Creation ===")
     try:
@@ -798,8 +883,13 @@ if __name__ == "__main__":
                 print(f"  Frame: {sample['metadata']['frame_name']}")
                 print(f"  Original size: {sample['metadata']['original_size']}")
                 print(f"  Target size: {sample['metadata']['target_size']}")
-                print(f"  Mask stats: min={sample['mask'].min():.3f}, max={sample['mask'].max():.3f}")
-                print(f"  Non-zero pixels: {torch.count_nonzero(sample['mask']).item()}")
+                if train_dataset.multiclass:
+                    print(f"  Mask stats: min={sample['mask'].min().item()}, max={sample['mask'].max().item()}")
+                    print(f"  Unique classes: {torch.unique(sample['mask']).tolist()}")
+                    print(f"  Non-zero pixels: {torch.count_nonzero(sample['mask']).item()}")
+                else:
+                    print(f"  Mask stats: min={sample['mask'].min():.3f}, max={sample['mask'].max():.3f}")
+                    print(f"  Non-zero pixels: {torch.count_nonzero(sample['mask']).item()}")
             
             # Test debugging functionality
             print("\n=== Testing Debug Functionality ===")

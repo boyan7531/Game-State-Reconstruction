@@ -15,7 +15,7 @@ import torchvision.models.segmentation as seg_models
 import numpy as np
 from tqdm import tqdm
 
-from dataset import create_train_dataset, create_val_dataset
+from dataset import create_train_dataset, create_val_dataset, NUM_CLASSES
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -97,7 +97,7 @@ class UNet(nn.Module):
         return self.sigmoid(out)
 
 
-def create_model(model_name: str = 'deeplabv3', backbone: str = 'resnet50', num_classes: int = 1) -> nn.Module:
+def create_model(model_name: str = 'deeplabv3', backbone: str = 'resnet50', num_classes: int = NUM_CLASSES, task_type: str = 'multiclass') -> nn.Module:
     """Create segmentation model."""
     if model_name == 'deeplabv3':
         if backbone == 'resnet50':
@@ -109,10 +109,17 @@ def create_model(model_name: str = 'deeplabv3', backbone: str = 'resnet50', num_
         
         # Modify classifier for our task
         model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-        # Initialize the new layer properly for thin line detection
-        # Use smaller initialization for better thin line sensitivity
-        nn.init.kaiming_normal_(model.classifier[4].weight, mode='fan_out', nonlinearity='relu')
-        nn.init.constant_(model.classifier[4].bias, -2.0)  # Slight negative bias for better thin line detection
+        
+        # Initialize the new layer appropriately for the task
+        if task_type == 'multiclass':
+            # Xavier initialization for multi-class classification
+            nn.init.xavier_uniform_(model.classifier[4].weight)
+            nn.init.constant_(model.classifier[4].bias, 0.0)
+        else:
+            # Original initialization for binary segmentation
+            nn.init.kaiming_normal_(model.classifier[4].weight, mode='fan_out', nonlinearity='relu')
+            nn.init.constant_(model.classifier[4].bias, -2.0)  # Slight negative bias for better thin line detection
+            
         model.aux_classifier = None  # Remove auxiliary classifier
         
     elif model_name == 'unet':
@@ -200,6 +207,36 @@ class WeightedBCELoss(nn.Module):
         return loss.mean()
 
 
+class MultiClassLoss(nn.Module):
+    def __init__(
+        self,
+        num_classes: int = NUM_CLASSES,
+        loss_type: str = 'cross_entropy',
+        class_weights: Optional[torch.Tensor] = None,
+        focal_alpha: float = 1.0,
+        focal_gamma: float = 2.0,
+        label_smoothing: float = 0.0
+    ):
+        super(MultiClassLoss, self).__init__()
+        self.num_classes = num_classes
+        self.loss_type = loss_type
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        
+        if loss_type == 'cross_entropy':
+            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        elif loss_type == 'focal':
+            # Focal loss for multi-class is more complex, use CrossEntropy for now
+            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        else:
+            raise ValueError(f"Unsupported loss type: {loss_type}")
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # pred shape: (N, C, H, W)
+        # target shape: (N, H, W)
+        return self.loss_fn(pred, target)
+
+
 class CombinedLoss(nn.Module):
     def __init__(
         self, 
@@ -208,93 +245,197 @@ class CombinedLoss(nn.Module):
         dice_weight: float = 0.8,
         focal_alpha: float = 1.0,
         focal_gamma: float = 2.0,
-        pos_weight: Optional[torch.Tensor] = None
+        pos_weight: Optional[torch.Tensor] = None,
+        task_type: str = 'binary',
+        num_classes: int = NUM_CLASSES
     ):
         super(CombinedLoss, self).__init__()
         self.loss_type = loss_type
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
+        self.task_type = task_type
+        self.num_classes = num_classes
         
-        if loss_type == 'focal_dice':
-            self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-            self.dice_loss = DiceLoss()
-        elif loss_type == 'weighted_bce_dice':
-            self.bce_loss = WeightedBCELoss(pos_weight=pos_weight)
-            self.dice_loss = DiceLoss()
-        else:  # fallback to original
-            self.bce_loss = nn.BCELoss()
-            self.dice_loss = DiceLoss()
+        if task_type == 'multiclass':
+            # For multi-class segmentation
+            self.multiclass_loss = MultiClassLoss(num_classes=num_classes, loss_type='cross_entropy')
+        else:
+            # For binary segmentation (original)
+            if loss_type == 'focal_dice':
+                self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+                self.dice_loss = DiceLoss()
+            elif loss_type == 'weighted_bce_dice':
+                self.bce_loss = WeightedBCELoss(pos_weight=pos_weight)
+                self.dice_loss = DiceLoss()
+            else:  # fallback to original
+                self.bce_loss = nn.BCELoss()
+                self.dice_loss = DiceLoss()
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Ensure predictions are in valid range [0, 1]
-        eps = 1e-7
-        pred = torch.clamp(pred, eps, 1 - eps)
-        target = torch.clamp(target, 0., 1.)
-        
-        # Check for NaN/Inf in inputs
-        if not torch.isfinite(pred).all():
-            logger.warning("NaN/Inf detected in predictions, replacing with zeros")
-            pred = torch.where(torch.isfinite(pred), pred, torch.zeros_like(pred))
-        
-        if not torch.isfinite(target).all():
-            logger.warning("NaN/Inf detected in targets, replacing with zeros")
-            target = torch.where(torch.isfinite(target), target, torch.zeros_like(target))
-        
-        dice = self.dice_loss(pred, target)
-        
-        if self.loss_type == 'focal_dice':
-            focal = self.focal_loss(pred, target)
-            combined = self.focal_weight * focal + self.dice_weight * dice
-        elif self.loss_type == 'weighted_bce_dice':
-            bce = self.bce_loss(pred, target)
-            combined = self.focal_weight * bce + self.dice_weight * dice
-        else:  # fallback
-            bce = self.bce_loss(pred, target)
-            combined = 0.5 * bce + 0.5 * dice
-        
-        # Final check for NaN/Inf in combined loss
-        if not torch.isfinite(combined):
-            logger.warning(f"NaN/Inf detected in combined loss: {combined}")
-            combined = torch.tensor(0.0, device=combined.device, requires_grad=True)
-        
-        return combined
+        if self.task_type == 'multiclass':
+            # For multi-class segmentation
+            # pred shape: (N, C, H, W), target shape: (N, H, W)
+            return self.multiclass_loss(pred, target)
+        else:
+            # For binary segmentation (original implementation)
+            # Ensure predictions are in valid range [0, 1]
+            eps = 1e-7
+            pred = torch.clamp(pred, eps, 1 - eps)
+            target = torch.clamp(target, 0., 1.)
+            
+            # Check for NaN/Inf in inputs
+            if not torch.isfinite(pred).all():
+                logger.warning("NaN/Inf detected in predictions, replacing with zeros")
+                pred = torch.where(torch.isfinite(pred), pred, torch.zeros_like(pred))
+            
+            if not torch.isfinite(target).all():
+                logger.warning("NaN/Inf detected in targets, replacing with zeros")
+                target = torch.where(torch.isfinite(target), target, torch.zeros_like(target))
+            
+            dice = self.dice_loss(pred, target)
+            
+            if self.loss_type == 'focal_dice':
+                focal = self.focal_loss(pred, target)
+                combined = self.focal_weight * focal + self.dice_weight * dice
+            elif self.loss_type == 'weighted_bce_dice':
+                bce = self.bce_loss(pred, target)
+                combined = self.focal_weight * bce + self.dice_weight * dice
+            else:  # fallback
+                bce = self.bce_loss(pred, target)
+                combined = 0.5 * bce + 0.5 * dice
+            
+            # Final check for NaN/Inf in combined loss
+            if not torch.isfinite(combined):
+                logger.warning(f"NaN/Inf detected in combined loss: {combined}")
+                combined = torch.tensor(0.0, device=combined.device, requires_grad=True)
+            
+            return combined
 
 
-class SegmentationMetrics:
-    def __init__(self, threshold: float = 0.5):
-        self.threshold = threshold
+class MultiClassMetrics:
+    def __init__(self, num_classes: int = NUM_CLASSES):
+        self.num_classes = num_classes
         self.reset()
     
     def reset(self):
-        self.tp = 0
-        self.fp = 0
-        self.tn = 0
-        self.fn = 0
+        self.total_samples = 0
+        self.correct_samples = 0
+        self.class_correct = torch.zeros(self.num_classes)
+        self.class_total = torch.zeros(self.num_classes)
+        self.confusion_matrix = torch.zeros(self.num_classes, self.num_classes)
     
     def update(self, pred: torch.Tensor, target: torch.Tensor):
-        pred_binary = (pred > self.threshold).float()
-        target_binary = target.float()
+        # pred shape: (N, C, H, W), target shape: (N, H, W)
+        pred_classes = torch.argmax(pred, dim=1)  # (N, H, W)
         
-        self.tp += ((pred_binary == 1) & (target_binary == 1)).sum().item()
-        self.fp += ((pred_binary == 1) & (target_binary == 0)).sum().item()
-        self.tn += ((pred_binary == 0) & (target_binary == 0)).sum().item()
-        self.fn += ((pred_binary == 0) & (target_binary == 1)).sum().item()
+        # Flatten for easier computation
+        pred_flat = pred_classes.view(-1)
+        target_flat = target.view(-1)
+        
+        # Update confusion matrix
+        for i in range(pred_flat.size(0)):
+            pred_class = pred_flat[i].item()
+            true_class = target_flat[i].item()
+            if 0 <= pred_class < self.num_classes and 0 <= true_class < self.num_classes:
+                self.confusion_matrix[true_class, pred_class] += 1
+        
+        # Update accuracy counters
+        correct = (pred_flat == target_flat).sum().item()
+        total = pred_flat.size(0)
+        
+        self.correct_samples += correct
+        self.total_samples += total
+        
+        # Per-class accuracy
+        for c in range(self.num_classes):
+            class_mask = (target_flat == c)
+            if class_mask.sum() > 0:
+                class_correct = ((pred_flat == target_flat) & class_mask).sum().item()
+                self.class_correct[c] += class_correct
+                self.class_total[c] += class_mask.sum().item()
     
     def compute(self) -> Dict[str, float]:
         eps = 1e-8
-        precision = self.tp / (self.tp + self.fp + eps)
-        recall = self.tp / (self.tp + self.fn + eps)
+        
+        # Overall accuracy
+        accuracy = self.correct_samples / (self.total_samples + eps)
+        
+        # Per-class metrics
+        precision = torch.diag(self.confusion_matrix) / (self.confusion_matrix.sum(dim=0) + eps)
+        recall = torch.diag(self.confusion_matrix) / (self.confusion_matrix.sum(dim=1) + eps)
         f1 = 2 * (precision * recall) / (precision + recall + eps)
-        iou = self.tp / (self.tp + self.fp + self.fn + eps)
-        accuracy = (self.tp + self.tn) / (self.tp + self.fp + self.tn + self.fn + eps)
+        
+        # Mean metrics (excluding background class for line metrics)
+        mean_precision = precision[1:].mean().item() if self.num_classes > 1 else precision.mean().item()
+        mean_recall = recall[1:].mean().item() if self.num_classes > 1 else recall.mean().item()
+        mean_f1 = f1[1:].mean().item() if self.num_classes > 1 else f1.mean().item()
+        
+        # IoU computation
+        intersection = torch.diag(self.confusion_matrix)
+        union = self.confusion_matrix.sum(dim=0) + self.confusion_matrix.sum(dim=1) - intersection
+        iou = intersection / (union + eps)
+        mean_iou = iou[1:].mean().item() if self.num_classes > 1 else iou.mean().item()
         
         return {
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'iou': iou,
-            'accuracy': accuracy
+            'accuracy': accuracy,
+            'precision': mean_precision,
+            'recall': mean_recall,
+            'f1': mean_f1,
+            'iou': mean_iou,
+            'mean_iou': mean_iou  # For compatibility
         }
+
+
+class SegmentationMetrics:
+    def __init__(self, threshold: float = 0.5, task_type: str = 'binary', num_classes: int = NUM_CLASSES):
+        self.threshold = threshold
+        self.task_type = task_type
+        self.num_classes = num_classes
+        
+        if task_type == 'multiclass':
+            self.metrics = MultiClassMetrics(num_classes)
+        else:
+            self.reset()
+    
+    def reset(self):
+        if self.task_type == 'multiclass':
+            self.metrics.reset()
+        else:
+            self.tp = 0
+            self.fp = 0
+            self.tn = 0
+            self.fn = 0
+    
+    def update(self, pred: torch.Tensor, target: torch.Tensor):
+        if self.task_type == 'multiclass':
+            self.metrics.update(pred, target)
+        else:
+            pred_binary = (pred > self.threshold).float()
+            target_binary = target.float()
+            
+            self.tp += ((pred_binary == 1) & (target_binary == 1)).sum().item()
+            self.fp += ((pred_binary == 1) & (target_binary == 0)).sum().item()
+            self.tn += ((pred_binary == 0) & (target_binary == 0)).sum().item()
+            self.fn += ((pred_binary == 0) & (target_binary == 1)).sum().item()
+    
+    def compute(self) -> Dict[str, float]:
+        if self.task_type == 'multiclass':
+            return self.metrics.compute()
+        else:
+            eps = 1e-8
+            precision = self.tp / (self.tp + self.fp + eps)
+            recall = self.tp / (self.tp + self.fn + eps)
+            f1 = 2 * (precision * recall) / (precision + recall + eps)
+            iou = self.tp / (self.tp + self.fp + self.fn + eps)
+            accuracy = (self.tp + self.tn) / (self.tp + self.fp + self.tn + self.fn + eps)
+            
+            return {
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'iou': iou,
+                'accuracy': accuracy
+            }
 
 
 def calculate_pos_weight(train_loader: DataLoader, device: str = 'cuda') -> torch.Tensor:
@@ -342,7 +483,9 @@ class Trainer:
         checkpoint_dir: str = 'checkpoints',
         warmup_epochs: int = 0,
         base_lr: float = 1e-3,
-        use_amp: bool = True
+        use_amp: bool = True,
+        task_type: str = 'binary',
+        num_classes: int = NUM_CLASSES
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -354,6 +497,8 @@ class Trainer:
         self.warmup_epochs = warmup_epochs
         self.base_lr = base_lr
         self.use_amp = use_amp and device == 'cuda'  # Only use AMP on CUDA
+        self.task_type = task_type
+        self.num_classes = num_classes
         
         # Initialize AMP scaler if using AMP
         self.scaler = GradScaler() if self.use_amp else None
@@ -371,8 +516,8 @@ class Trainer:
         # Training state
         self.epoch = 0
         self.best_val_iou = 0.0
-        self.train_metrics = SegmentationMetrics()
-        self.val_metrics = SegmentationMetrics()
+        self.train_metrics = SegmentationMetrics(task_type=task_type, num_classes=num_classes)
+        self.val_metrics = SegmentationMetrics(task_type=task_type, num_classes=num_classes)
         
         logger.info(f"Trainer initialized. Experiment: {self.experiment_name}")
         logger.info(f"Device: {device}")
@@ -404,9 +549,9 @@ class Trainer:
                     if isinstance(outputs, dict):  # DeepLabV3 returns dict
                         outputs = outputs['out']
                     
-                    # Apply sigmoid to get probabilities for DeepLabV3
-                    # UNet already has sigmoid in forward pass
-                    if hasattr(self.model, 'classifier'):  # DeepLabV3 model
+                    # Apply sigmoid for binary segmentation only
+                    # For multi-class, use raw logits
+                    if self.task_type == 'binary' and hasattr(self.model, 'classifier'):  # DeepLabV3 model
                         outputs = torch.sigmoid(outputs)
                     
                     loss = self.criterion(outputs, masks)
@@ -430,9 +575,9 @@ class Trainer:
                 if isinstance(outputs, dict):  # DeepLabV3 returns dict
                     outputs = outputs['out']
                 
-                # Apply sigmoid to get probabilities for DeepLabV3
-                # UNet already has sigmoid in forward pass
-                if hasattr(self.model, 'classifier'):  # DeepLabV3 model
+                # Apply sigmoid for binary segmentation only
+                # For multi-class, use raw logits
+                if self.task_type == 'binary' and hasattr(self.model, 'classifier'):  # DeepLabV3 model
                     outputs = torch.sigmoid(outputs)
                 
                 loss = self.criterion(outputs, masks)
@@ -512,9 +657,9 @@ class Trainer:
                     if isinstance(outputs, dict):  # DeepLabV3 returns dict
                         outputs = outputs['out']
                     
-                    # Apply sigmoid to get probabilities for DeepLabV3
-                    # UNet already has sigmoid in forward pass
-                    if hasattr(self.model, 'classifier'):  # DeepLabV3 model
+                    # Apply sigmoid for binary segmentation only
+                    # For multi-class, use raw logits
+                    if self.task_type == 'binary' and hasattr(self.model, 'classifier'):  # DeepLabV3 model
                         outputs = torch.sigmoid(outputs)
                     
                     loss = self.criterion(outputs, masks)
@@ -655,6 +800,10 @@ def main():
                        help='Scale range for multi-scale augmentation (min, max)')
     parser.add_argument('--no-augment', action='store_true',
                        help='Disable data augmentation for training')
+    parser.add_argument('--task-type', type=str, default='multiclass', choices=['binary', 'multiclass'],
+                       help='Task type: binary or multiclass segmentation')
+    parser.add_argument('--num-classes', type=int, default=NUM_CLASSES,
+                       help='Number of classes for multi-class segmentation')
     
     args = parser.parse_args()
     
@@ -693,6 +842,8 @@ def main():
     
     # Log training improvements
     logger.info("=== TRAINING CONFIGURATION ===")
+    logger.info(f"Task type: {args.task_type}")
+    logger.info(f"Number of classes: {args.num_classes}")
     logger.info(f"AMP enabled: {use_amp} (speeds up training on modern GPUs)")
     logger.info(f"Line thickness: {args.line_thickness}px")
     logger.info(f"Loss function: {args.loss_type} (focal_weight={args.focal_weight}, dice_weight={args.dice_weight})")
@@ -704,7 +855,10 @@ def main():
     logger.info(f"Multi-scale augmentation: {args.enable_multiscale_augmentation}")
     if args.enable_multiscale_augmentation:
         logger.info(f"Scale range: {args.scale_range[0]:.1f} - {args.scale_range[1]:.1f}")
-    logger.info("Class imbalance handling: Automatic pos_weight calculation and focal loss")
+    if args.task_type == 'binary':
+        logger.info("Class imbalance handling: Automatic pos_weight calculation and focal loss")
+    else:
+        logger.info("Class imbalance handling: Cross-entropy loss with optional class weights")
     logger.info("================================")
     
     # Create datasets from separate train and valid folders
@@ -717,7 +871,9 @@ def main():
         'target_size': tuple(args.target_size),
         'line_thickness': args.line_thickness,
         'cache_masks': False,
-        'augment': not args.no_augment
+        'augment': not args.no_augment,
+        'multiclass': args.task_type == 'multiclass',
+        'num_classes': args.num_classes
     }
     
     # Add multi-scale augmentation if enabled
@@ -732,14 +888,16 @@ def main():
         val_data_root,
         target_size=tuple(args.target_size),
         line_thickness=args.line_thickness,
-        cache_masks=False
+        cache_masks=False,
+        multiclass=args.task_type == 'multiclass',
+        num_classes=args.num_classes
     )
     
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
     # Create model
     logger.info(f"Creating {args.model} model with {args.backbone} backbone...")
-    model = create_model(args.model, args.backbone, num_classes=1)
+    model = create_model(args.model, args.backbone, num_classes=args.num_classes, task_type=args.task_type)
     
     # Create data loaders first (needed for pos_weight calculation)
     train_loader = DataLoader(
@@ -758,8 +916,10 @@ def main():
         pin_memory=True
     )
     
-    # Calculate positive weight for class balancing
-    pos_weight = calculate_pos_weight(train_loader, device)
+    # Calculate positive weight for class balancing (binary only)
+    pos_weight = None
+    if args.task_type == 'binary':
+        pos_weight = calculate_pos_weight(train_loader, device)
     
     # Create improved loss function and optimizer  
     criterion = CombinedLoss(
@@ -768,7 +928,9 @@ def main():
         dice_weight=args.dice_weight,
         focal_alpha=1.0,
         focal_gamma=args.focal_gamma,
-        pos_weight=pos_weight if args.loss_type == 'weighted_bce_dice' else None
+        pos_weight=pos_weight if args.loss_type == 'weighted_bce_dice' else None,
+        task_type=args.task_type,
+        num_classes=args.num_classes
     )
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -795,7 +957,9 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         warmup_epochs=args.warmup_epochs,
         base_lr=args.lr,
-        use_amp=use_amp
+        use_amp=use_amp,
+        task_type=args.task_type,
+        num_classes=args.num_classes
     )
     
     # Start training
