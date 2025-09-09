@@ -721,7 +721,15 @@ class Trainer:
         # Log metrics
         self.writer.add_scalar('Train/Loss', avg_loss, self.epoch)
         for metric_name, metric_value in metrics.items():
-            self.writer.add_scalar(f'Train/{metric_name.capitalize()}', metric_value, self.epoch)
+            if metric_name != 'per_class':  # Skip per_class as it's a dict
+                self.writer.add_scalar(f'Train/{metric_name.capitalize()}', metric_value, self.epoch)
+        
+        # Log per-class metrics to TensorBoard if available
+        if 'per_class' in metrics and self.task_type == 'multiclass':
+            for class_name, class_metrics in metrics['per_class'].items():
+                for metric_name, metric_value in class_metrics.items():
+                    if metric_name != 'pixel_count':  # Skip pixel count for TensorBoard
+                        self.writer.add_scalar(f'Train_PerClass/{class_name}_{metric_name}', metric_value, self.epoch)
         
         return {'loss': avg_loss, **metrics}
     
