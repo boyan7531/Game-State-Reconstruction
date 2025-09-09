@@ -500,7 +500,7 @@ def calculate_class_weights(train_loader: DataLoader, num_classes: int, device: 
     total_pixels = 0
     
     # Sample a subset of the data to estimate class distribution
-    max_batches = min(100, len(train_loader))  # Sample up to 100 batches for better estimate
+    max_batches = min(50, len(train_loader))  # Sample up to 50 batches - sufficient for weight estimation
     
     with torch.no_grad():
         for i, batch in enumerate(train_loader):
@@ -509,9 +509,11 @@ def calculate_class_weights(train_loader: DataLoader, num_classes: int, device: 
                 
             masks = batch['mask']  # Shape: (B, H, W) with class indices
             
-            # Count pixels for each class
-            for class_id in range(num_classes):
-                class_counts[class_id] += (masks == class_id).sum().item()
+            # Count pixels for each class (vectorized - much faster)
+            unique_classes, counts = torch.unique(masks, return_counts=True)
+            for class_id, count in zip(unique_classes.cpu().numpy(), counts.cpu().numpy()):
+                if 0 <= class_id < num_classes:
+                    class_counts[class_id] += count
             
             total_pixels += masks.numel()
     
