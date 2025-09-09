@@ -15,7 +15,7 @@ import torchvision.models.segmentation as seg_models
 import numpy as np
 from tqdm import tqdm
 
-from dataset import create_train_dataset, create_val_dataset, NUM_CLASSES
+from dataset import create_train_dataset, create_val_dataset, NUM_CLASSES, CLASS_TO_LINE_MAPPING
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -114,7 +114,11 @@ def create_model(model_name: str = 'deeplabv3', backbone: str = 'resnet50', num_
         if task_type == 'multiclass':
             # Xavier initialization for multi-class classification
             nn.init.xavier_uniform_(model.classifier[4].weight)
-            nn.init.constant_(model.classifier[4].bias, 0.0)
+            # Initialize bias with small negative values to encourage learning rare classes
+            with torch.no_grad():
+                # Set background bias to 0, others slightly negative to encourage detection
+                model.classifier[4].bias[0] = 0.0  # Background
+                model.classifier[4].bias[1:] = -0.1  # All line classes get slight negative bias
         else:
             # Original initialization for binary segmentation
             nn.init.kaiming_normal_(model.classifier[4].weight, mode='fan_out', nonlinearity='relu')
@@ -215,7 +219,7 @@ class MultiClassLoss(nn.Module):
         class_weights: Optional[torch.Tensor] = None,
         focal_alpha: float = 1.0,
         focal_gamma: float = 2.0,
-        label_smoothing: float = 0.0
+        label_smoothing: float = 0.1  # Add some label smoothing by default
     ):
         super(MultiClassLoss, self).__init__()
         self.num_classes = num_classes
@@ -224,10 +228,10 @@ class MultiClassLoss(nn.Module):
         self.focal_gamma = focal_gamma
         
         if loss_type == 'cross_entropy':
-            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing, ignore_index=-1)
         elif loss_type == 'focal':
             # Focal loss for multi-class is more complex, use CrossEntropy for now
-            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing, ignore_index=-1)
         else:
             raise ValueError(f"Unsupported loss type: {loss_type}")
     
@@ -247,7 +251,8 @@ class CombinedLoss(nn.Module):
         focal_gamma: float = 2.0,
         pos_weight: Optional[torch.Tensor] = None,
         task_type: str = 'binary',
-        num_classes: int = NUM_CLASSES
+        num_classes: int = NUM_CLASSES,
+        **kwargs  # Accept additional kwargs like class_weights
     ):
         super(CombinedLoss, self).__init__()
         self.loss_type = loss_type
@@ -257,8 +262,9 @@ class CombinedLoss(nn.Module):
         self.num_classes = num_classes
         
         if task_type == 'multiclass':
-            # For multi-class segmentation
-            self.multiclass_loss = MultiClassLoss(num_classes=num_classes, loss_type='cross_entropy')
+            # For multi-class segmentation - accept class weights from outside
+            class_weights = kwargs.get('class_weights', None)
+            self.multiclass_loss = MultiClassLoss(num_classes=num_classes, loss_type='cross_entropy', class_weights=class_weights)
         else:
             # For binary segmentation (original)
             if loss_type == 'focal_dice':
@@ -357,7 +363,7 @@ class MultiClassMetrics:
         self.class_correct += correct_per_class.float().to(self.device)
         self.class_total += total_per_class.float().to(self.device)
     
-    def compute(self) -> Dict[str, float]:
+    def compute(self) -> Dict[str, Any]:
         eps = 1e-8
         
         # Overall accuracy
@@ -368,16 +374,28 @@ class MultiClassMetrics:
         recall = torch.diag(self.confusion_matrix) / (self.confusion_matrix.sum(dim=1) + eps)
         f1 = 2 * (precision * recall) / (precision + recall + eps)
         
-        # Mean metrics (excluding background class for line metrics)
-        mean_precision = precision[1:].mean().item() if self.num_classes > 1 else precision.mean().item()
-        mean_recall = recall[1:].mean().item() if self.num_classes > 1 else recall.mean().item()
-        mean_f1 = f1[1:].mean().item() if self.num_classes > 1 else f1.mean().item()
-        
         # IoU computation
         intersection = torch.diag(self.confusion_matrix)
         union = self.confusion_matrix.sum(dim=0) + self.confusion_matrix.sum(dim=1) - intersection
         iou = intersection / (union + eps)
+        
+        # Mean metrics (excluding background class for line metrics)
+        mean_precision = precision[1:].mean().item() if self.num_classes > 1 else precision.mean().item()
+        mean_recall = recall[1:].mean().item() if self.num_classes > 1 else recall.mean().item()
+        mean_f1 = f1[1:].mean().item() if self.num_classes > 1 else f1.mean().item()
         mean_iou = iou[1:].mean().item() if self.num_classes > 1 else iou.mean().item()
+        
+        # Per-class breakdown
+        per_class_metrics = {}
+        for class_id in range(self.num_classes):
+            class_name = CLASS_TO_LINE_MAPPING.get(class_id, f"Class_{class_id}")
+            per_class_metrics[class_name] = {
+                'precision': precision[class_id].item(),
+                'recall': recall[class_id].item(),
+                'f1': f1[class_id].item(),
+                'iou': iou[class_id].item(),
+                'pixel_count': self.confusion_matrix.sum(dim=1)[class_id].item()
+            }
         
         return {
             'accuracy': accuracy,
@@ -385,7 +403,8 @@ class MultiClassMetrics:
             'recall': mean_recall,
             'f1': mean_f1,
             'iou': mean_iou,
-            'mean_iou': mean_iou  # For compatibility
+            'mean_iou': mean_iou,  # For compatibility
+            'per_class': per_class_metrics
         }
 
 
@@ -471,6 +490,84 @@ def calculate_pos_weight(train_loader: DataLoader, device: str = 'cuda') -> torc
     logger.info(f"Calculated pos_weight: {pos_weight:.4f}")
     
     return torch.tensor(pos_weight, dtype=torch.float32, device=device)
+
+
+def calculate_class_weights(train_loader: DataLoader, num_classes: int, device: str = 'cuda') -> torch.Tensor:
+    """Calculate class weights for multiclass imbalance handling."""
+    logger.info("Calculating class weights for multiclass balancing...")
+    
+    class_counts = torch.zeros(num_classes, dtype=torch.float64)
+    total_pixels = 0
+    
+    # Sample a subset of the data to estimate class distribution
+    max_batches = min(100, len(train_loader))  # Sample up to 100 batches for better estimate
+    
+    with torch.no_grad():
+        for i, batch in enumerate(train_loader):
+            if i >= max_batches:
+                break
+                
+            masks = batch['mask']  # Shape: (B, H, W) with class indices
+            
+            # Count pixels for each class
+            for class_id in range(num_classes):
+                class_counts[class_id] += (masks == class_id).sum().item()
+            
+            total_pixels += masks.numel()
+    
+    # Calculate class frequencies
+    class_frequencies = class_counts / total_pixels
+    
+    # Calculate weights only among line classes (exclude background)
+    class_weights = torch.ones(num_classes, dtype=torch.float64)
+    
+    # Background gets weight 1.0 (low weight since it's easy to detect)
+    class_weights[0] = 1.0
+    
+    # Calculate total line pixels (excluding background)
+    total_line_pixels = class_counts[1:].sum()
+    
+    if total_line_pixels > 0:
+        # Calculate line class frequencies relative to total line pixels
+        line_frequencies = class_counts[1:] / total_line_pixels
+        
+        # Calculate inverse frequency weights for line classes only
+        for class_id in range(1, num_classes):
+            if class_counts[class_id] > 0:
+                # Inverse frequency weighting among line classes
+                line_freq = line_frequencies[class_id - 1]
+                class_weights[class_id] = 1.0 / (line_freq + 1e-8)
+            else:
+                class_weights[class_id] = 1.0
+        
+        # Normalize line weights so the most common line class has weight ~2-3
+        max_line_weight = class_weights[1:].max()
+        if max_line_weight > 0:
+            normalization_factor = 3.0 / max_line_weight
+            class_weights[1:] *= normalization_factor
+    
+    # Log class distribution with more details
+    logger.info("Class distribution:")
+    logger.info(f"  background: {class_frequencies[0]:.6f} (weight: {class_weights[0]:.2f})")
+    logger.info("Line class distribution (among line pixels only):")
+    
+    for class_id in range(1, num_classes):  # Show ALL line classes
+        if class_frequencies[class_id] > 0:
+            class_name = CLASS_TO_LINE_MAPPING.get(class_id, f"Class_{class_id}")
+            line_freq_relative = class_counts[class_id] / total_line_pixels if total_line_pixels > 0 else 0
+            logger.info(f"  {class_name}: {class_frequencies[class_id]:.6f} ({line_freq_relative:.4f} of line pixels, weight: {class_weights[class_id]:.2f})")
+    
+    # Also log classes with zero pixels (they exist in the mapping but not in this sample)
+    missing_classes = []
+    for class_id in range(1, num_classes):
+        if class_frequencies[class_id] == 0:
+            class_name = CLASS_TO_LINE_MAPPING.get(class_id, f"Class_{class_id}")
+            missing_classes.append(class_name)
+    
+    if missing_classes:
+        logger.info(f"Classes not found in sample: {', '.join(missing_classes)}")
+    
+    return class_weights.float().to(device)
 
 
 class Trainer:
@@ -679,7 +776,15 @@ class Trainer:
         # Log metrics
         self.writer.add_scalar('Val/Loss', avg_loss, self.epoch)
         for metric_name, metric_value in metrics.items():
-            self.writer.add_scalar(f'Val/{metric_name.capitalize()}', metric_value, self.epoch)
+            if metric_name != 'per_class':  # Skip per_class as it's a dict
+                self.writer.add_scalar(f'Val/{metric_name.capitalize()}', metric_value, self.epoch)
+        
+        # Log per-class metrics to TensorBoard if available
+        if 'per_class' in metrics and self.task_type == 'multiclass':
+            for class_name, class_metrics in metrics['per_class'].items():
+                for metric_name, metric_value in class_metrics.items():
+                    if metric_name != 'pixel_count':  # Skip pixel count for TensorBoard
+                        self.writer.add_scalar(f'Val_PerClass/{class_name}_{metric_name}', metric_value, self.epoch)
         
         return {'loss': avg_loss, **metrics}
     
@@ -750,6 +855,31 @@ class Trainer:
                 f"Val IoU: {val_metrics['iou']:.4f}"
             )
             
+            # Log per-class breakdown for multiclass tasks
+            if self.task_type == 'multiclass' and 'per_class' in val_metrics:
+                logger.info("Per-class validation metrics:")
+                
+                # Sort classes by IoU for better readability
+                per_class = val_metrics['per_class']
+                sorted_classes = sorted(per_class.items(), key=lambda x: x[1]['iou'], reverse=True)
+                
+                for class_name, metrics in sorted_classes:
+                    if class_name != 'background' and metrics['pixel_count'] > 0:  # Skip background and empty classes
+                        logger.info(
+                            f"  {class_name:.<25} IoU: {metrics['iou']:.4f}, "
+                            f"F1: {metrics['f1']:.4f}, "
+                            f"Pixels: {int(metrics['pixel_count']):>6}"
+                        )
+                
+                # Show background separately
+                if 'background' in per_class:
+                    bg_metrics = per_class['background']
+                    logger.info(
+                        f"  {'background':.<25} IoU: {bg_metrics['iou']:.4f}, "
+                        f"F1: {bg_metrics['f1']:.4f}, "
+                        f"Pixels: {int(bg_metrics['pixel_count']):>6}"
+                    )
+            
             # Save checkpoint
             if (epoch + 1) % save_freq == 0 or is_best:
                 self.save_checkpoint(is_best=is_best)
@@ -766,11 +896,11 @@ def main():
                        help='Model architecture')
     parser.add_argument('--backbone', type=str, default='resnet50', choices=['resnet50', 'resnet101', 'resnet34'],
                        help='Model backbone')
-    parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
+    parser.add_argument('--batch-size', type=int, default=4, help='Batch size (reduced for higher resolution)')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate (reduced for multiclass stability)')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
-    parser.add_argument('--target-size', type=int, nargs=2, default=[512, 512], help='Target image size')
+    parser.add_argument('--target-size', type=int, nargs=2, default=[1024, 1024], help='Target image size (1024 recommended for thin lines)')
     parser.add_argument('--num-workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], help='Device to use')
     parser.add_argument('--log-dir', type=str, default='runs', help='TensorBoard log directory')
@@ -788,12 +918,12 @@ def main():
                        help='Gamma parameter for focal loss (higher values focus more on hard examples)')
     parser.add_argument('--focal-gamma-thin-lines', type=float, default=None,
                        help='Optional higher gamma for thin line detection (goal posts, crossbars)')
-    parser.add_argument('--line-thickness', type=int, default=8, 
-                       help='Line thickness for pitch mask generation')
+    parser.add_argument('--line-thickness', type=int, default=4, 
+                       help='Line thickness for pitch mask generation (4 recommended for 1024 resolution)')
     parser.add_argument('--use-cosine-scheduler', action='store_true',
                        help='Use cosine annealing scheduler instead of ReduceLROnPlateau')
-    parser.add_argument('--warmup-epochs', type=int, default=3,
-                       help='Number of warmup epochs for learning rate')
+    parser.add_argument('--warmup-epochs', type=int, default=5,
+                       help='Number of warmup epochs for learning rate (increased for multiclass)')
     parser.add_argument('--use-amp', action='store_true', default=True,
                        help='Use Automatic Mixed Precision for faster training')
     parser.add_argument('--no-amp', action='store_true',
@@ -808,6 +938,10 @@ def main():
                        help='Task type: binary or multiclass segmentation')
     parser.add_argument('--num-classes', type=int, default=NUM_CLASSES,
                        help='Number of classes for multi-class segmentation')
+    parser.add_argument('--label-smoothing', type=float, default=0.1,
+                       help='Label smoothing factor for cross-entropy loss')
+    parser.add_argument('--class-weighting', action='store_true', default=True,
+                       help='Use class weighting to handle imbalanced classes')
     
     args = parser.parse_args()
     
@@ -844,16 +978,23 @@ def main():
     # Determine AMP usage
     use_amp = args.use_amp and not args.no_amp and device == 'cuda'
     
+    # Determine loss type early for logging
+    if args.task_type == 'multiclass':
+        loss_type = 'cross_entropy'  # Override for multiclass
+    else:
+        loss_type = args.loss_type
+    
     # Log training improvements
     logger.info("=== TRAINING CONFIGURATION ===")
     logger.info(f"Task type: {args.task_type}")
     logger.info(f"Number of classes: {args.num_classes}")
-    logger.info(f"AMP enabled: {use_amp} (speeds up training on modern GPUs)")
+    logger.info(f"Resolution: {args.target_size[0]}x{args.target_size[1]} (higher res = better thin line detection)")
+    logger.info(f"Batch size: {args.batch_size} (reduced for higher resolution)")
+    logger.info(f"AMP enabled: {use_amp} (critical for memory efficiency at 1024 resolution)")
     logger.info(f"Line thickness: {args.line_thickness}px")
-    logger.info(f"Loss function: {args.loss_type} (focal_weight={args.focal_weight}, dice_weight={args.dice_weight})")
-    logger.info(f"Focal gamma: {args.focal_gamma} (higher = focus on hard examples)")
-    if args.focal_gamma_thin_lines:
-        logger.info(f"Thin line focal gamma: {args.focal_gamma_thin_lines} (for goal posts/crossbars)")
+    logger.info(f"Loss function: {loss_type} {'(forced to cross_entropy for multiclass)' if args.task_type == 'multiclass' else ''}")
+    logger.info(f"Class weighting: {args.class_weighting} (critical for imbalanced classes)")
+    logger.info(f"Label smoothing: {args.label_smoothing}")
     logger.info(f"Learning rate: {args.lr}")
     logger.info(f"Scheduler: {'CosineAnnealing' if args.use_cosine_scheduler else 'ReduceLROnPlateau'}")
     logger.info(f"Multi-scale augmentation: {args.enable_multiscale_augmentation}")
@@ -862,7 +1003,16 @@ def main():
     if args.task_type == 'binary':
         logger.info("Class imbalance handling: Automatic pos_weight calculation and focal loss")
     else:
-        logger.info("Class imbalance handling: Cross-entropy loss with optional class weights")
+        logger.info("Class imbalance handling: Cross-entropy loss with class weights and label smoothing")
+    
+    # Memory usage warning for high resolution
+    if args.target_size[0] >= 1024:
+        logger.info("🚨 HIGH RESOLUTION MODE:")
+        logger.info("  - Using 1024x1024 for better thin line detection")
+        logger.info("  - Reduced batch size to prevent OOM")
+        logger.info("  - AMP is critical for memory efficiency")
+        logger.info("  - Expected ~4x better performance on goal posts/crossbars")
+    
     logger.info("================================")
     
     # Create datasets from separate train and valid folders
@@ -880,11 +1030,15 @@ def main():
         'num_classes': args.num_classes
     }
     
-    # Add multi-scale augmentation if enabled
+    # Add multi-scale augmentation if enabled (will be passed to PitchAugmentation)
     if args.enable_multiscale_augmentation:
         train_kwargs['scale_range'] = args.scale_range
-        train_kwargs['enable_multiscale'] = True
         logger.info("Enhanced multi-scale augmentation enabled for better thin line detection")
+    
+    # Override no-augment for multiclass (augmentation is crucial for multiclass)
+    if args.task_type == 'multiclass' and args.no_augment:
+        logger.warning("Enabling data augmentation for multiclass training - it's crucial for performance")
+        train_kwargs['augment'] = True
     
     train_dataset = create_train_dataset(train_data_root, **train_kwargs)
     
@@ -920,21 +1074,30 @@ def main():
         pin_memory=True
     )
     
-    # Calculate positive weight for class balancing (binary only)
+    # Calculate weights for class balancing
     pos_weight = None
+    class_weights = None
+    
     if args.task_type == 'binary':
         pos_weight = calculate_pos_weight(train_loader, device)
+    elif args.task_type == 'multiclass' and args.class_weighting:
+        class_weights = calculate_class_weights(train_loader, args.num_classes, device)
     
     # Create improved loss function and optimizer  
+    # loss_type already determined above for logging
+    if args.task_type == 'multiclass':
+        logger.info(f"Using cross_entropy loss for multiclass segmentation")
+        
     criterion = CombinedLoss(
-        loss_type=args.loss_type,
+        loss_type=loss_type,
         focal_weight=args.focal_weight,
         dice_weight=args.dice_weight,
         focal_alpha=1.0,
         focal_gamma=args.focal_gamma,
-        pos_weight=pos_weight if args.loss_type == 'weighted_bce_dice' else None,
+        pos_weight=pos_weight if loss_type == 'weighted_bce_dice' else None,
         task_type=args.task_type,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        class_weights=class_weights  # Pass class weights for multiclass
     )
     
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

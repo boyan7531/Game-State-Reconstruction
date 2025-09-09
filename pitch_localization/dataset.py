@@ -711,6 +711,7 @@ class PitchAugmentation:
         hue_range: float = 0.1,
         horizontal_flip_prob: float = 0.5,
         vertical_flip_prob: float = 0.0,
+        scale_range: Optional[Tuple[float, float]] = None,
         normalize: bool = True
     ):
         """
@@ -725,6 +726,7 @@ class PitchAugmentation:
             hue_range: Range for hue adjustment
             horizontal_flip_prob: Probability of horizontal flip
             vertical_flip_prob: Probability of vertical flip
+            scale_range: Optional tuple (min_scale, max_scale) for multi-scale augmentation
             normalize: Whether to apply ImageNet normalization
         """
         self.target_size = target_size
@@ -735,6 +737,7 @@ class PitchAugmentation:
         self.hue_range = hue_range
         self.horizontal_flip_prob = horizontal_flip_prob
         self.vertical_flip_prob = vertical_flip_prob
+        self.scale_range = scale_range
         self.normalize = normalize
         
         if normalize:
@@ -763,9 +766,30 @@ class PitchAugmentation:
             image = transforms.functional.rotate(image, angle, fill=0)
             mask_pil = transforms.functional.rotate(mask_pil, angle, fill=0)
         
-        # Resize both image and mask
-        image = transforms.functional.resize(image, self.target_size)
-        mask_pil = transforms.functional.resize(mask_pil, self.target_size, interpolation=Image.NEAREST)
+        # Apply multi-scale augmentation if enabled
+        if self.scale_range is not None:
+            scale_factor = np.random.uniform(self.scale_range[0], self.scale_range[1])
+            scaled_size = (int(self.target_size[0] * scale_factor), int(self.target_size[1] * scale_factor))
+            image = transforms.functional.resize(image, scaled_size)
+            mask_pil = transforms.functional.resize(mask_pil, scaled_size, interpolation=Image.NEAREST)
+            
+            # Center crop or pad to target size
+            if scale_factor > 1.0:
+                # Scale up - need to crop to target size
+                image = transforms.functional.center_crop(image, self.target_size)
+                mask_pil = transforms.functional.center_crop(mask_pil, self.target_size)
+            else:
+                # Scale down - need to pad to target size
+                # Calculate padding to make it exactly target_size
+                pad_w = max(0, self.target_size[0] - scaled_size[0])
+                pad_h = max(0, self.target_size[1] - scaled_size[1])
+                padding = [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2]  # left, top, right, bottom
+                image = transforms.functional.pad(image, padding, fill=0)
+                mask_pil = transforms.functional.pad(mask_pil, padding, fill=0)
+        else:
+            # Standard resize to target size
+            image = transforms.functional.resize(image, self.target_size)
+            mask_pil = transforms.functional.resize(mask_pil, self.target_size, interpolation=Image.NEAREST)
         
         # Apply photometric transformations to image only
         if self.brightness_range > 0:
@@ -813,7 +837,8 @@ def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
             brightness_range=kwargs.get('brightness_range', 0.15),
             contrast_range=kwargs.get('contrast_range', 0.15),
             saturation_range=kwargs.get('saturation_range', 0.15),
-            horizontal_flip_prob=kwargs.get('horizontal_flip_prob', 0.5)
+            horizontal_flip_prob=kwargs.get('horizontal_flip_prob', 0.5),
+            scale_range=kwargs.get('scale_range', None)
         )
     
     return PitchLocalizationDataset(
@@ -821,7 +846,7 @@ def create_train_dataset(data_root: str, **kwargs) -> PitchLocalizationDataset:
         transform=transform,
         **{k: v for k, v in kwargs.items() if k not in [
             'rotation_range', 'brightness_range', 'contrast_range', 
-            'saturation_range', 'horizontal_flip_prob', 'augment'
+            'saturation_range', 'horizontal_flip_prob', 'augment', 'scale_range'
         ]}
     )
 

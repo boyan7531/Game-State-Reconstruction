@@ -18,14 +18,14 @@ from sklearn.metrics import confusion_matrix, classification_report
 import json
 
 from train import create_model
-from dataset import PitchLocalizationDataset
+from dataset import PitchLocalizationDataset, NUM_CLASSES, LINE_CLASS_MAPPING, CLASS_TO_LINE_MAPPING
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class PitchVideoProcessor:
-    def __init__(self, model_path: str, device: str = 'auto'):
+    def __init__(self, model_path: str, device: str = 'auto', task_type: str = 'auto', num_classes: int = None):
         """Initialize the video processor with a trained model."""
         # Set device
         if device == 'auto':
@@ -40,26 +40,54 @@ class PitchVideoProcessor:
         
         logger.info(f"Using device: {self.device}")
         
-        # Load model
-        self.model = self._load_model(model_path)
+        # Load model and determine task type
+        self.model, self.task_type, self.num_classes = self._load_model(model_path, task_type, num_classes)
         logger.info(f"Model loaded from {model_path}")
+        logger.info(f"Task type: {self.task_type}, Number of classes: {self.num_classes}")
         
         # Image preprocessing parameters
         self.target_size = (512, 512)
         self.normalize_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         self.normalize_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     
-    def _load_model(self, model_path: str):
-        """Load the trained model."""
+    def _load_model(self, model_path: str, task_type: str = 'auto', num_classes: int = None):
+        """Load the trained model and determine its configuration."""
         checkpoint = torch.load(model_path, map_location=self.device)
         
-        # Create model (adjust architecture if needed based on checkpoint)
-        model = create_model('deeplabv3', 'resnet50', num_classes=1)
+        # Try to determine task type and num_classes from checkpoint or infer from model
+        if task_type == 'auto' or num_classes is None:
+            # First, try to create a test model to inspect the output shape
+            try:
+                # Try multiclass first (most likely scenario)
+                test_model = create_model('deeplabv3', 'resnet50', num_classes=NUM_CLASSES, task_type='multiclass')
+                test_model.load_state_dict(checkpoint['model_state_dict'])
+                detected_task_type = 'multiclass'
+                detected_num_classes = NUM_CLASSES
+                logger.info("Detected multiclass model")
+            except Exception:
+                try:
+                    # Try binary as fallback
+                    test_model = create_model('deeplabv3', 'resnet50', num_classes=1, task_type='binary')
+                    test_model.load_state_dict(checkpoint['model_state_dict'])
+                    detected_task_type = 'binary'
+                    detected_num_classes = 1
+                    logger.info("Detected binary model")
+                except Exception as e:
+                    logger.error(f"Could not determine model type: {e}")
+                    # Default to multiclass
+                    detected_task_type = 'multiclass'
+                    detected_num_classes = NUM_CLASSES
+        else:
+            detected_task_type = task_type
+            detected_num_classes = num_classes if num_classes is not None else (NUM_CLASSES if task_type == 'multiclass' else 1)
+        
+        # Create the actual model
+        model = create_model('deeplabv3', 'resnet50', num_classes=detected_num_classes, task_type=detected_task_type)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(self.device)
         model.eval()
         
-        return model
+        return model, detected_task_type, detected_num_classes
     
     def preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
         """Preprocess a single frame for model input."""
@@ -91,62 +119,109 @@ class PitchVideoProcessor:
             if isinstance(output, dict):
                 output = output['out']
             
-            # Apply sigmoid and threshold
-            pred_mask = torch.sigmoid(output).squeeze().cpu().numpy()
-            
-            if adaptive_threshold:
-                pred_binary = self._apply_adaptive_threshold(pred_mask, threshold)
+            if self.task_type == 'multiclass':
+                # For multiclass: use softmax and argmax
+                pred_probs = torch.softmax(output, dim=1).squeeze().cpu().numpy()  # (C, H, W)
+                pred_classes = np.argmax(pred_probs, axis=0).astype(np.uint8)  # (H, W)
+                
+                # Resize back to original frame size
+                h, w = frame.shape[:2]
+                pred_resized = cv2.resize(pred_classes, (w, h), interpolation=cv2.INTER_NEAREST)
+                
+                return pred_resized
             else:
-                pred_binary = (pred_mask > threshold).astype(np.uint8)
-            
-            # Resize back to original frame size
-            h, w = frame.shape[:2]
-            pred_resized = cv2.resize(pred_binary, (w, h), interpolation=cv2.INTER_NEAREST)
-            
-            # Goal post enhancement post-processing
-            if enhance_goal_posts:
-                pred_resized = self._enhance_goal_posts(pred_resized)
-            
-            return pred_resized
+                # For binary: use sigmoid and threshold
+                pred_mask = torch.sigmoid(output).squeeze().cpu().numpy()
+                
+                if adaptive_threshold:
+                    pred_binary = self._apply_adaptive_threshold(pred_mask, threshold)
+                else:
+                    pred_binary = (pred_mask > threshold).astype(np.uint8)
+                
+                # Resize back to original frame size
+                h, w = frame.shape[:2]
+                pred_resized = cv2.resize(pred_binary, (w, h), interpolation=cv2.INTER_NEAREST)
+                
+                # Goal post enhancement post-processing
+                if enhance_goal_posts:
+                    pred_resized = self._enhance_goal_posts(pred_resized)
+                
+                return pred_resized
     
     def _predict_multiscale(self, frame: np.ndarray, threshold: float = 0.5, enhance_goal_posts: bool = True) -> np.ndarray:
         """Multi-scale inference for better thin line detection."""
         h, w = frame.shape[:2]
         scales = [0.8, 1.0, 1.2]  # Different scales to capture various line thicknesses
         
-        predictions = []
-        
-        for scale in scales:
-            # Resize frame
-            new_h, new_w = int(h * scale), int(w * scale)
-            scaled_frame = cv2.resize(frame, (new_w, new_h))
+        if self.task_type == 'multiclass':
+            # For multiclass: collect probability distributions
+            predictions = []
             
-            # Preprocess scaled frame
-            frame_tensor = self.preprocess_frame(scaled_frame)
+            for scale in scales:
+                # Resize frame
+                new_h, new_w = int(h * scale), int(w * scale)
+                scaled_frame = cv2.resize(frame, (new_w, new_h))
+                
+                # Preprocess scaled frame
+                frame_tensor = self.preprocess_frame(scaled_frame)
+                
+                # Predict
+                output = self.model(frame_tensor)
+                if isinstance(output, dict):
+                    output = output['out']
+                
+                # Get probability distribution
+                pred_probs = torch.softmax(output, dim=1).squeeze().cpu().numpy()  # (C, H, W)
+                
+                # Resize back to original size
+                pred_probs_resized = np.zeros((self.num_classes, h, w), dtype=np.float32)
+                for c in range(self.num_classes):
+                    pred_probs_resized[c] = cv2.resize(pred_probs[c], (w, h), interpolation=cv2.INTER_LINEAR)
+                
+                predictions.append(pred_probs_resized)
             
-            # Predict
-            output = self.model(frame_tensor)
-            if isinstance(output, dict):
-                output = output['out']
+            # Average predictions from different scales
+            avg_probs = np.mean(predictions, axis=0)  # (C, H, W)
             
-            # Get probability map
-            pred_prob = torch.sigmoid(output).squeeze().cpu().numpy()
+            # Get final class predictions
+            pred_classes = np.argmax(avg_probs, axis=0).astype(np.uint8)  # (H, W)
             
-            # Resize back to original size
-            pred_prob_resized = cv2.resize(pred_prob, (w, h), interpolation=cv2.INTER_LINEAR)
-            predictions.append(pred_prob_resized)
-        
-        # Average predictions from different scales
-        avg_pred = np.mean(predictions, axis=0)
-        
-        # Apply threshold
-        pred_binary = (avg_pred > threshold).astype(np.uint8)
-        
-        # Goal post enhancement post-processing
-        if enhance_goal_posts:
-            pred_binary = self._enhance_goal_posts(pred_binary)
-        
-        return pred_binary
+            return pred_classes
+        else:
+            # For binary: original implementation
+            predictions = []
+            
+            for scale in scales:
+                # Resize frame
+                new_h, new_w = int(h * scale), int(w * scale)
+                scaled_frame = cv2.resize(frame, (new_w, new_h))
+                
+                # Preprocess scaled frame
+                frame_tensor = self.preprocess_frame(scaled_frame)
+                
+                # Predict
+                output = self.model(frame_tensor)
+                if isinstance(output, dict):
+                    output = output['out']
+                
+                # Get probability map
+                pred_prob = torch.sigmoid(output).squeeze().cpu().numpy()
+                
+                # Resize back to original size
+                pred_prob_resized = cv2.resize(pred_prob, (w, h), interpolation=cv2.INTER_LINEAR)
+                predictions.append(pred_prob_resized)
+            
+            # Average predictions from different scales
+            avg_pred = np.mean(predictions, axis=0)
+            
+            # Apply threshold
+            pred_binary = (avg_pred > threshold).astype(np.uint8)
+            
+            # Goal post enhancement post-processing
+            if enhance_goal_posts:
+                pred_binary = self._enhance_goal_posts(pred_binary)
+            
+            return pred_binary
     
     def _apply_adaptive_threshold(self, pred_prob: np.ndarray, base_threshold: float) -> np.ndarray:
         """Apply adaptive thresholding based on local statistics to better detect thin structures."""
@@ -242,21 +317,123 @@ class PitchVideoProcessor:
         
         return enhanced_mask
     
+    def _get_class_colors(self):
+        """Get color map for different pitch line classes."""
+        # Define distinct colors for each class
+        colors = {
+            0: (0, 0, 0),        # Background - black
+            1: (255, 0, 0),      # Side line top - red
+            2: (0, 255, 0),      # Circle central - green
+            3: (0, 0, 255),      # Big rect. right main - blue
+            4: (255, 255, 0),    # Big rect. right top - cyan
+            5: (255, 0, 255),    # Big rect. left main - magenta
+            6: (0, 255, 255),    # Big rect. left top - yellow
+            7: (128, 0, 128),    # Circle right - purple
+            8: (255, 165, 0),    # Middle line - orange
+            9: (255, 192, 203),  # Side line right - pink
+            10: (0, 128, 0),     # Circle left - dark green
+            11: (128, 128, 0),   # Side line bottom - olive
+            12: (0, 0, 128),     # Side line left - navy
+            13: (128, 0, 0),     # Small rect. right main - maroon
+            14: (0, 128, 128),   # Small rect. right top - teal
+            15: (128, 128, 128), # Small rect. left main - gray
+            16: (255, 228, 196), # Small rect. left top - bisque
+            17: (255, 20, 147),  # Goal right post left - deep pink
+            18: (0, 191, 255),   # Goal right crossbar - deep sky blue
+            19: (50, 205, 50),   # Goal left post right - lime green
+            20: (255, 69, 0),    # Goal left crossbar - red orange
+            21: (138, 43, 226),  # Goal right post right - blue violet
+            22: (255, 140, 0),   # Small rect. right bottom - dark orange
+            23: (32, 178, 170),  # Big rect. right bottom - light sea green
+            24: (220, 20, 60),   # Goal left post left - crimson
+            25: (75, 0, 130),    # Small rect. left bottom - indigo
+            26: (255, 215, 0),   # Big rect. left bottom - gold
+        }
+        return colors
+    
+    def _add_class_legend(self, image: np.ndarray, colors: dict) -> np.ndarray:
+        """Add a legend showing class colors and names."""
+        h, w = image.shape[:2]
+        legend_width = 300
+        legend_height = min(h, 600)
+        
+        # Create legend area
+        legend = np.zeros((legend_height, legend_width, 3), dtype=np.uint8)
+        
+        # Add title
+        cv2.putText(legend, "Pitch Lines", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Add class entries (only for classes 1-26, skip background)
+        y_offset = 50
+        line_height = 20
+        
+        for class_id in range(1, min(self.num_classes, 27)):  # Limit to visible area
+            if class_id in CLASS_TO_LINE_MAPPING and class_id in colors:
+                class_name = CLASS_TO_LINE_MAPPING[class_id]
+                color = colors[class_id]
+                
+                # Draw colored rectangle
+                cv2.rectangle(legend, (10, y_offset - 10), (30, y_offset + 5), color, -1)
+                
+                # Add class name (truncated if too long)
+                name_text = class_name[:25] + '...' if len(class_name) > 25 else class_name
+                cv2.putText(legend, name_text, (35, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                y_offset += line_height
+                
+                if y_offset > legend_height - 20:
+                    break
+        
+        # Combine image with legend
+        if w + legend_width <= 1920:  # Only add legend if it fits
+            result = np.hstack([image, legend])
+        else:
+            result = image
+        
+        return result
+    
     def overlay_mask_on_frame(self, frame: np.ndarray, mask: np.ndarray, 
-                             color: tuple = (0, 255, 0), alpha: float = 0.7) -> np.ndarray:
+                             color: tuple = (0, 255, 0), alpha: float = 0.7, show_legend: bool = False) -> np.ndarray:
         """Overlay predicted mask on the original frame."""
         overlay = frame.copy()
         
-        # Create colored mask
-        colored_mask = np.zeros_like(frame)
-        colored_mask[mask > 0] = color
-        
-        # Blend with original frame
-        result = cv2.addWeighted(frame, 1-alpha, colored_mask, alpha, 0)
-        
-        # Add mask contours for better visibility
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(result, contours, -1, color, 2)
+        if self.task_type == 'multiclass':
+            # Create color map for different classes
+            colors = self._get_class_colors()
+            
+            # Create colored mask
+            colored_mask = np.zeros_like(frame)
+            for class_id in range(1, self.num_classes):  # Skip background (0)
+                class_mask = (mask == class_id)
+                if np.any(class_mask):
+                    colored_mask[class_mask] = colors[class_id]
+            
+            # Blend with original frame
+            result = cv2.addWeighted(frame, 1-alpha, colored_mask, alpha, 0)
+            
+            # Add contours for each class
+            for class_id in range(1, self.num_classes):  # Skip background (0)
+                class_mask = (mask == class_id).astype(np.uint8) * 255
+                if np.any(class_mask):
+                    contours, _ = cv2.findContours(class_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(result, contours, -1, colors[class_id], 2)
+            
+            # Add legend if requested
+            if show_legend:
+                result = self._add_class_legend(result, colors)
+                
+        else:
+            # Binary mode (original implementation)
+            # Create colored mask
+            colored_mask = np.zeros_like(frame)
+            colored_mask[mask > 0] = color
+            
+            # Blend with original frame
+            result = cv2.addWeighted(frame, 1-alpha, colored_mask, alpha, 0)
+            
+            # Add mask contours for better visibility
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(result, contours, -1, color, 2)
         
         return result
     
@@ -329,17 +506,96 @@ class PitchVideoProcessor:
         return line_masks
     
     def _get_gt_mask(self, annotations: dict, frame_name: str, width: int, height: int) -> np.ndarray:
-        """Generate combined ground truth mask from annotations (for backward compatibility)."""
-        line_masks = self._get_gt_masks_by_line_type(annotations, frame_name, width, height)
-        if not line_masks:
+        """Generate ground truth mask from annotations."""
+        if self.task_type == 'multiclass':
+            return self._get_gt_multiclass_mask(annotations, frame_name, width, height)
+        else:
+            # Binary mode (original implementation)
+            line_masks = self._get_gt_masks_by_line_type(annotations, frame_name, width, height)
+            if not line_masks:
+                return None
+            
+            # Combine all line masks
+            combined_mask = np.zeros((height, width), dtype=np.uint8)
+            for mask in line_masks.values():
+                combined_mask = np.maximum(combined_mask, mask)
+            
+            return combined_mask
+    
+    def _get_gt_multiclass_mask(self, annotations: dict, frame_name: str, width: int, height: int) -> np.ndarray:
+        """Generate multiclass ground truth mask from annotations."""
+        from dataset import create_pitch_mask
+        
+        # Parse from the annotations directly
+        pitch_lines = self._parse_pitch_geometry_from_annotations(annotations, frame_name, width, height)
+        
+        if pitch_lines is None:
             return None
         
-        # Combine all line masks
-        combined_mask = np.zeros((height, width), dtype=np.uint8)
-        for mask in line_masks.values():
-            combined_mask = np.maximum(combined_mask, mask)
+        # Create multiclass mask using dataset function
+        mask = create_pitch_mask(pitch_lines, width, height, line_thickness=2, multiclass=True)
         
-        return combined_mask
+        return mask
+    
+    def _parse_pitch_geometry_from_annotations(self, annotations: dict, frame_name: str, width: int, height: int) -> dict:
+        """Parse pitch geometry directly from loaded annotations."""
+        # Find the specific image
+        target_image = None
+        for img in annotations.get("images", []):
+            if img.get("file_name") == frame_name:
+                target_image = img
+                break
+        
+        if target_image is None or not target_image.get("has_labeled_pitch", False):
+            return None
+        
+        # Find annotations for this image
+        pitch_annotations = []
+        image_id = target_image.get("image_id")
+        
+        for ann in annotations.get("annotations", []):
+            if (ann.get("image_id") == image_id and 
+                ann.get("supercategory") == "pitch"):
+                pitch_annotations.append(ann)
+        
+        if not pitch_annotations:
+            return None
+        
+        # Extract and denormalize line coordinates
+        pitch_lines = {}
+        
+        for ann in pitch_annotations:
+            lines = ann.get("lines", {})
+            
+            for line_name, line_coords in lines.items():
+                if not isinstance(line_coords, list) or len(line_coords) == 0:
+                    continue
+                    
+                denormalized_coords = []
+                
+                for coord in line_coords:
+                    try:
+                        if isinstance(coord, dict) and 'x' in coord and 'y' in coord:
+                            x_norm, y_norm = float(coord['x']), float(coord['y'])
+                        elif isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                            x_norm, y_norm = float(coord[0]), float(coord[1])
+                        else:
+                            continue
+                        
+                        x_px = x_norm * width
+                        y_px = y_norm * height
+                        
+                        x_px = max(0, min(x_px, width))
+                        y_px = max(0, min(y_px, height))
+                        
+                        denormalized_coords.append((x_px, y_px))
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                
+                if denormalized_coords:
+                    pitch_lines[line_name] = denormalized_coords
+        
+        return pitch_lines if pitch_lines else None
     
     def evaluate_on_sequence_by_line_type(self, sequence_dir: str, threshold: float = 0.5, max_frames: int = None, 
                                          multiscale: bool = False, enhance_goal_posts: bool = True, adaptive_threshold: bool = False):
@@ -388,40 +644,95 @@ class PitchVideoProcessor:
             # Get prediction mask
             pred_mask = self.predict_mask(frame, threshold, enhance_goal_posts=enhance_goal_posts, 
                                         multiscale=multiscale, adaptive_threshold=adaptive_threshold)
-            pred_binary = (pred_mask > 0).astype(np.uint8)
             
-            # Calculate metrics for each line type
-            for line_type, gt_mask in gt_masks_by_type.items():
-                if line_type not in line_type_metrics:
-                    line_type_metrics[line_type] = {
-                        'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0,
-                        'total_gt_pixels': 0, 'total_pred_pixels': 0,
-                        'frames_with_gt': 0
-                    }
+            if self.task_type == 'multiclass':
+                # For multiclass: evaluate per-class performance
+                gt_multiclass_mask = self._get_gt_multiclass_mask(annotations, frame_file.name, w, h)
+                if gt_multiclass_mask is None:
+                    continue
                 
-                gt_binary = (gt_mask > 0).astype(np.uint8)
+                # Calculate metrics for each class that appears in either GT or prediction
+                unique_gt_classes = np.unique(gt_multiclass_mask)
+                unique_pred_classes = np.unique(pred_mask)
+                all_classes = np.unique(np.concatenate([unique_gt_classes, unique_pred_classes]))
                 
-                # Flatten for metrics
-                gt_flat = gt_binary.flatten()
-                pred_flat = pred_binary.flatten()
+                for class_id in all_classes:
+                    if class_id == 0:  # Skip background
+                        continue
+                    
+                    class_name = CLASS_TO_LINE_MAPPING.get(class_id, f"Class_{class_id}")
+                    
+                    if class_name not in line_type_metrics:
+                        line_type_metrics[class_name] = {
+                            'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0,
+                            'total_gt_pixels': 0, 'total_pred_pixels': 0,
+                            'frames_with_gt': 0
+                        }
+                    
+                    # Create binary masks for this class
+                    gt_binary = (gt_multiclass_mask == class_id).astype(np.uint8)
+                    pred_binary = (pred_mask == class_id).astype(np.uint8)
+                    
+                    # Flatten for metrics
+                    gt_flat = gt_binary.flatten()
+                    pred_flat = pred_binary.flatten()
+                    
+                    # Update confusion matrix for this class
+                    tp = np.sum((gt_flat == 1) & (pred_flat == 1))
+                    fp = np.sum((gt_flat == 0) & (pred_flat == 1))
+                    tn = np.sum((gt_flat == 0) & (pred_flat == 0))
+                    fn = np.sum((gt_flat == 1) & (pred_flat == 0))
+                    
+                    line_type_metrics[class_name]['tp'] += tp
+                    line_type_metrics[class_name]['fp'] += fp
+                    line_type_metrics[class_name]['tn'] += tn
+                    line_type_metrics[class_name]['fn'] += fn
+                    line_type_metrics[class_name]['total_gt_pixels'] += np.sum(gt_flat)
+                    line_type_metrics[class_name]['total_pred_pixels'] += np.sum(pred_flat)
+                    
+                    if np.sum(gt_flat) > 0:  # Only count frames where this class exists in GT
+                        line_type_metrics[class_name]['frames_with_gt'] += 1
                 
-                # Update confusion matrix for this line type
-                tp = np.sum((gt_flat == 1) & (pred_flat == 1))
-                fp = np.sum((gt_flat == 0) & (pred_flat == 1))
-                tn = np.sum((gt_flat == 0) & (pred_flat == 0))
-                fn = np.sum((gt_flat == 1) & (pred_flat == 0))
+                # Overall pixel accuracy
+                overall_correct_pixels += np.sum(gt_multiclass_mask.flatten() == pred_mask.flatten())
+                overall_total_pixels += gt_multiclass_mask.size
                 
-                line_type_metrics[line_type]['tp'] += tp
-                line_type_metrics[line_type]['fp'] += fp
-                line_type_metrics[line_type]['tn'] += tn
-                line_type_metrics[line_type]['fn'] += fn
-                line_type_metrics[line_type]['total_gt_pixels'] += np.sum(gt_flat)
-                line_type_metrics[line_type]['total_pred_pixels'] += np.sum(pred_flat)
-                line_type_metrics[line_type]['frames_with_gt'] += 1
+            else:
+                # Binary mode (original implementation)
+                pred_binary = (pred_mask > 0).astype(np.uint8)
                 
-                # Overall metrics
-                overall_correct_pixels += np.sum(gt_flat == pred_flat)
-                overall_total_pixels += len(gt_flat)
+                # Calculate metrics for each line type
+                for line_type, gt_mask in gt_masks_by_type.items():
+                    if line_type not in line_type_metrics:
+                        line_type_metrics[line_type] = {
+                            'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0,
+                            'total_gt_pixels': 0, 'total_pred_pixels': 0,
+                            'frames_with_gt': 0
+                        }
+                    
+                    gt_binary = (gt_mask > 0).astype(np.uint8)
+                    
+                    # Flatten for metrics
+                    gt_flat = gt_binary.flatten()
+                    pred_flat = pred_binary.flatten()
+                    
+                    # Update confusion matrix for this line type
+                    tp = np.sum((gt_flat == 1) & (pred_flat == 1))
+                    fp = np.sum((gt_flat == 0) & (pred_flat == 1))
+                    tn = np.sum((gt_flat == 0) & (pred_flat == 0))
+                    fn = np.sum((gt_flat == 1) & (pred_flat == 0))
+                    
+                    line_type_metrics[line_type]['tp'] += tp
+                    line_type_metrics[line_type]['fp'] += fp
+                    line_type_metrics[line_type]['tn'] += tn
+                    line_type_metrics[line_type]['fn'] += fn
+                    line_type_metrics[line_type]['total_gt_pixels'] += np.sum(gt_flat)
+                    line_type_metrics[line_type]['total_pred_pixels'] += np.sum(pred_flat)
+                    line_type_metrics[line_type]['frames_with_gt'] += 1
+                    
+                    # Overall metrics
+                    overall_correct_pixels += np.sum(gt_flat == pred_flat)
+                    overall_total_pixels += len(gt_flat)
             
             total_frames += 1
         
@@ -431,15 +742,19 @@ class PitchVideoProcessor:
         
         # Calculate and display results
         print("\n" + "="*80)
-        print(f"PER-LINE-TYPE EVALUATION RESULTS - {sequence_dir.name}")
+        mode_str = "MULTICLASS" if self.task_type == 'multiclass' else "BINARY PER-LINE-TYPE"
+        print(f"{mode_str} EVALUATION RESULTS - {sequence_dir.name}")
         print("="*80)
         print(f"Total frames evaluated: {total_frames}")
-        print(f"Threshold: {threshold}")
+        print(f"Task type: {self.task_type}")
+        if self.task_type == 'binary':
+            print(f"Threshold: {threshold}")
         
         # Sort line types for consistent output
         sorted_line_types = sorted(line_type_metrics.keys())
         
-        print(f"\n{'Line Type':<25} {'Precision':<10} {'Recall':<10} {'F1':<8} {'IoU':<8} {'GT Pixels':<12} {'Frames':<8}")
+        class_or_line = "Class" if self.task_type == 'multiclass' else "Line Type"
+        print(f"\n{class_or_line:<25} {'Precision':<10} {'Recall':<10} {'F1':<8} {'IoU':<8} {'GT Pixels':<12} {'Frames':<8}")
         print("-" * 80)
         
         results = {}
@@ -506,7 +821,7 @@ class PitchVideoProcessor:
     
     def process_sequence_to_video(self, sequence_dir: str, output_path: str, 
                                  fps: int = 10, max_frames: int = None,
-                                 threshold: float = 0.5, show_comparison: bool = True):
+                                 threshold: float = 0.5, show_comparison: bool = True, show_legend: bool = False):
         """Process an entire sequence and create a video."""
         sequence_dir = Path(sequence_dir)
         img_dir = sequence_dir / "img1"
@@ -564,7 +879,7 @@ class PitchVideoProcessor:
             pred_mask = self.predict_mask(frame, threshold)
             
             # Create overlay
-            overlay_frame = self.overlay_mask_on_frame(frame, pred_mask, color=(0, 255, 0), alpha=0.6)
+            overlay_frame = self.overlay_mask_on_frame(frame, pred_mask, color=(0, 255, 0), alpha=0.6, show_legend=show_legend)
             
             if show_comparison:
                 # Try to get ground truth
@@ -911,7 +1226,7 @@ class PitchVideoProcessor:
         pred_mask = self.predict_mask(frame, threshold)
         
         # Create overlay
-        overlay_frame = self.overlay_mask_on_frame(frame, pred_mask, color=(0, 255, 0), alpha=0.6)
+        overlay_frame = self.overlay_mask_on_frame(frame, pred_mask, color=(0, 255, 0), alpha=0.6, show_legend=False)
         
         # Save result
         cv2.imwrite(output_path, overlay_frame)
@@ -951,11 +1266,17 @@ def main():
                        help='Disable goal post enhancement post-processing')
     parser.add_argument('--adaptive-threshold', action='store_true',
                        help='Use adaptive thresholding for better thin line detection')
+    parser.add_argument('--task-type', type=str, default='auto', choices=['auto', 'binary', 'multiclass'],
+                       help='Task type: auto-detect, binary, or multiclass')
+    parser.add_argument('--num-classes', type=int, default=None,
+                       help='Number of classes (auto-detect if not specified)')
+    parser.add_argument('--show-legend', action='store_true',
+                       help='Show class legend in multiclass visualization')
     
     args = parser.parse_args()
     
     # Initialize processor
-    processor = PitchVideoProcessor(args.model_path, args.device)
+    processor = PitchVideoProcessor(args.model_path, args.device, args.task_type, args.num_classes)
     
     if args.evaluate:
         # Run evaluation mode
@@ -990,7 +1311,8 @@ def main():
             fps=args.fps,
             max_frames=args.max_frames,
             threshold=args.threshold,
-            show_comparison=not args.no_comparison
+            show_comparison=not args.no_comparison,
+            show_legend=args.show_legend
         )
 
 
